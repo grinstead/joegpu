@@ -1,35 +1,81 @@
-import { createSignal } from 'solid-js'
-import solidLogo from './assets/solid.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { Component, JSX, Show, createSignal } from "solid-js";
+import "./App.css";
 
-function App() {
-  const [count, setCount] = createSignal(0)
+export function App() {
+  const [result, setResult] = createSignal<Result<Component>>();
+
+  createGPUCanvas().then(setResult, (error) =>
+    setResult({ success: false, error })
+  );
 
   return (
-    <>
-      <div>
-        <a href="https://vitejs.dev" target="_blank">
-          <img src={viteLogo} class="logo" alt="Vite logo" />
-        </a>
-        <a href="https://solidjs.com" target="_blank">
-          <img src={solidLogo} class="logo solid" alt="Solid logo" />
-        </a>
-      </div>
-      <h1>Vite + Solid</h1>
-      <div class="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count()}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p class="read-the-docs">
-        Click on the Vite and Solid logos to learn more
-      </p>
-    </>
-  )
+    <Show when={result()} fallback={<div>Loading...</div>}>
+      {(r) => {
+        const Item = r();
+        return Item.success ? <Item.value /> : String(Item.error);
+      }}
+    </Show>
+  );
 }
 
-export default App
+type Result<T, Error = unknown> =
+  | {
+      success: true;
+      value: T;
+    }
+  | {
+      success: false;
+      error: Error;
+    };
+
+async function createGPUCanvas(): Promise<Result<() => JSX.Element>> {
+  const { gpu } = navigator as Partial<NavigatorGPU>;
+
+  if (!gpu) {
+    return {
+      success: false,
+      error: "This browser is not supported, consider Chrome",
+    };
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+
+  if (!adapter) {
+    return {
+      success: false,
+      error: "This hardware is not supported",
+    };
+  }
+
+  const device = await adapter.requestDevice();
+
+  const canvas = (<canvas width={512} height={512} />) as HTMLCanvasElement;
+
+  const context = canvas.getContext("webgpu");
+
+  if (!context) {
+    return {
+      success: false,
+      error: "Failed to initialize canvas",
+    };
+  }
+
+  context.configure({
+    device,
+    format: gpu.getPreferredCanvasFormat(),
+  });
+
+  return {
+    success: true,
+    value: () => <GPUCanvas device={device} canvas={canvas} />,
+  };
+}
+
+type GPUCanvasProps = {
+  device: GPUDevice;
+  canvas: HTMLCanvasElement;
+};
+
+function GPUCanvas(props: GPUCanvasProps) {
+  return props.canvas;
+}
