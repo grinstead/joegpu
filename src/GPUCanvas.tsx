@@ -4,6 +4,7 @@ export type GPUCanvasDetails = {
   context: GPUCanvasContext;
   device: GPUDevice;
   canvas: HTMLCanvasElement;
+  format: GPUTextureFormat;
 };
 
 export type GPUCanvasProps = {
@@ -48,13 +49,12 @@ export async function createGPUCanvas(): Promise<Result<GPUCanvasDetails>> {
     };
   }
 
-  context.configure({
-    device,
-    format: gpu.getPreferredCanvasFormat(),
-  });
+  const format = gpu.getPreferredCanvasFormat();
+
+  context.configure({ device, format });
 
   return {
     success: true,
-    value: { context, device, canvas },
+    value: { context, device, canvas, format },
   };
 }
