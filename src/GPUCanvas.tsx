@@ -1,34 +1,22 @@
 import { Result } from "./utils";
 
-export type GPUCanvasProps = {
+export type GPUCanvasDetails = {
   context: GPUCanvasContext;
   device: GPUDevice;
   canvas: HTMLCanvasElement;
 };
 
+export type GPUCanvasProps = {
+  details: GPUCanvasDetails;
+  render: (details: GPUCanvasDetails) => void;
+};
+
 export function GPUCanvas(props: GPUCanvasProps) {
-  const { device, context, canvas } = props;
-
-  const encoder = device.createCommandEncoder();
-
-  const pass = encoder.beginRenderPass({
-    colorAttachments: [
-      {
-        view: context.getCurrentTexture().createView(),
-        loadOp: "clear",
-        storeOp: "store",
-      },
-    ],
-  });
-
-  pass.end();
-
-  device.queue.submit([encoder.finish()]);
-
-  return canvas;
+  props.render(props.details);
+  return props.details.canvas;
 }
 
-export async function createGPUCanvas(): Promise<Result<GPUCanvasProps>> {
+export async function createGPUCanvas(): Promise<Result<GPUCanvasDetails>> {
   const { gpu } = navigator as Partial<NavigatorGPU>;
 
   if (!gpu) {
