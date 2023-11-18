@@ -1,7 +1,57 @@
 import { Show, createSignal } from "solid-js";
 import "./App.css";
 import { GPUCanvas, GPUCanvasDetails, createGPUCanvas } from "./GPUCanvas";
-import { Result } from "./utils";
+import { NUM_BYTES_FLOAT32, Result } from "./utils";
+import exampleDataUrl from "./assets/example.ply?url";
+import { findString } from "./searchBytes.ts";
+import { MutatingMatrix } from "./matrix.ts";
+import { QUAD_VERTICES } from "./gpu_utils.ts";
+import { renderUsingQuads } from "./renderUsingQuads.ts";
+import { NUM_PROPERTIES_PLY } from "./ply.ts";
+
+/*
+
+x^T sigma^-1 x
+            (a b 0)   (x)
+(x, y, z) * (e f 0) * (y)
+            (0 0 0)   (z)
+
+            ->
+            (ax + by)
+(x, y, z) * (ex + fy)
+            (0)
+           ->
+
+(ax + by)x + (ex + fy)y
+
+  ->
+
+ax^2 + bxy + exy + fy^2
+
+ax^2 + (b + e)xy + fy^2
+
+
+
+(a b c)
+(. f g)
+(. . j)
+
+(a b c 0)
+(b f g 0)
+(c g j 0)
+(0 0 0 0)
+
+
+sqrt(max(0.1, mid * mid - det));
+
+mid = average of the two standard deviations
+
+determinant =  // a * c - b * b 
+
+
+*/
+
+type Point = { x: number; y: number };
 
 export function App() {
   const [result, setResult] = createSignal<Result<GPUCanvasDetails>>();
@@ -11,188 +61,154 @@ export function App() {
   );
 
   return (
-    <Show when={result()} fallback={<div>Loading...</div>}>
-      {(r) => {
-        const item = r();
-        return item.success ? (
-          <GPUCanvas details={item.value} render={renderAppCanvas} />
-        ) : (
-          String(item.error)
-        );
-      }}
-    </Show>
+    <>
+      <Show when={result()} fallback={<div>Loading...</div>}>
+        {(r) => {
+          const item = r();
+          return item.success ? (
+            <GPUCanvas details={item.value} render={renderAppCanvas} />
+          ) : (
+            String(item.error)
+          );
+        }}
+      </Show>
+    </>
   );
 }
 
-function renderAppCanvas(props: GPUCanvasDetails) {
-  const { device, context, format } = props;
+function projectedAngle(x: number) {
+  return Math.atan2(Math.sqrt(1 - x * x), x);
+}
 
-  const GRID_SIZE = 32;
-  const uniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
-  const uniformBuffer = device.createBuffer({
-    label: "Grid Uniforms",
-    size: uniformArray.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
+function clamp(value: number, min: number, max: number) {
+  return value < min ? min : value < max ? value : max;
+}
 
-  device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+async function renderAppCanvas(props: GPUCanvasDetails) {
+  const fileBytes = await (await fetch(exampleDataUrl)).arrayBuffer();
 
-  const cellStateArray = new Uint32Array(GRID_SIZE * GRID_SIZE);
-  const cellStateStorage = [
-    device.createBuffer({
-      label: "Cell State A",
-      size: cellStateArray.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    }),
-    device.createBuffer({
-      label: "Cell State B",
-      size: cellStateArray.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    }),
-  ];
+  const bodyIndex =
+    findString(new Uint8Array(fileBytes), "end_header\n") +
+    "end_header\n".length;
 
-  for (let i = 0; i < cellStateArray.length; i += 3) {
-    cellStateArray[i] = 1;
-  }
-  device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+  const { device, canvas } = props;
 
-  for (let i = 1; i < cellStateArray.length; i += 3) {
-    cellStateArray[i] = 1;
-  }
-  device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
-
-  // prettier-ignore
-  const vertices = new Float32Array([
-    -0.8, -0.8, // Triangle 1 (Blue)
-      0.8, -0.8,
-      0.8,  0.8,
-
-    -0.8, -0.8, // Triangle 2 (Red)
-      0.8,  0.8,
-    -0.8,  0.8,
-  ]);
-
-  const vertexBuffer = device.createBuffer({
-    label: "Cell vertices",
-    size: vertices.byteLength,
+  const splatDataBuffer = device.createBuffer({
+    label: "Splat Data",
+    size: fileBytes.byteLength - bodyIndex,
     usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   });
 
-  device.queue.writeBuffer(vertexBuffer, 0, vertices);
+  const numSplats =
+    (fileBytes.byteLength - bodyIndex) / NUM_BYTES_FLOAT32 / NUM_PROPERTIES_PLY;
 
-  const vertexBufferLayout: GPUVertexBufferLayout = {
-    arrayStride: 8,
-    attributes: [
-      {
-        format: "float32x2",
-        offset: 0,
-        shaderLocation: 0,
-      },
-    ],
-  };
+  device.queue.writeBuffer(splatDataBuffer, 0, fileBytes, bodyIndex);
 
-  const shader = device.createShaderModule({
-    label: "Cell shader",
-    code: `
-@group(0) @binding(0) var<uniform> grid: vec2f;
-@group(0) @binding(1) var<storage> cellState: array<u32>;
+  const CANVAS_RADIUS = 256;
 
-@vertex
-fn vertexMain(@location(0) pos: vec2f, @builtin(instance_index) instance: u32) -> @builtin(position) vec4f {
-  let i = f32(instance);
-  let cell = vec2f(i % grid.x, floor(i / grid.x));
-  let state = f32(cellState[instance]);
+  let rotation = { x: -0.279, y: -0.371, z: 0 };
+  let zoom = { x: 1, y: 1, z: 1 };
+  let translation = { x: -1.383, y: -0.387, z: 2.001 };
+  let renderUntil = 0;
 
-  let cellOffset = cell / grid * 2;
+  let mouseStatus:
+    | undefined
+    | {
+        meta: "shift" | "alt" | undefined;
+        startPoint: Point;
+        lastPoint: Point;
+        translation: typeof translation;
+        lastTimeMs: number;
+      };
 
-  return vec4f((pos * state + 1) / grid - 1 + cellOffset, 0, 1);
-}
+  canvas.addEventListener("mousemove", (event) => {
+    // only respond to events that have a mouse down
+    if ((event.buttons & 1) === 0) {
+      return;
+    }
 
-@fragment
-fn fragmentMain() -> @location(0) vec4f {
-  return vec4f(1, 0, 0, 1);
-}
-`,
+    if (!renderUntil) {
+      renderUntil = Date.now();
+      requestAnimationFrame(render);
+    }
+
+    const { offsetX, offsetY } = event;
+    let x = clamp(offsetX / CANVAS_RADIUS, 0, 2) - 1;
+    let y = 1 - clamp(offsetY / CANVAS_RADIUS, 0, 2);
+
+    const point = { x, y };
+
+    const meta = event.shiftKey ? "shift" : event.altKey ? "alt" : undefined;
+
+    const now = Date.now();
+    if (
+      mouseStatus &&
+      (now > mouseStatus.lastTimeMs + 100 || meta !== mouseStatus.meta)
+    ) {
+      mouseStatus = undefined;
+    }
+
+    if (!mouseStatus) {
+      mouseStatus = {
+        meta,
+        startPoint: point,
+        lastPoint: point,
+        lastTimeMs: now,
+        translation: { ...translation },
+      };
+      return;
+    }
+
+    if (meta === "shift") {
+      const { startPoint } = mouseStatus;
+      const startMag = Math.sqrt(startPoint.x ** 2 + startPoint.y ** 2);
+      const dot = startPoint.x * x + startPoint.y * y;
+
+      const zScale = dot / startMag / startMag;
+
+      translation.z = mouseStatus.translation.z / zScale;
+      rotation.z +=
+        Math.atan2(y, x) -
+        Math.atan2(mouseStatus.lastPoint.y, mouseStatus.lastPoint.x);
+    } else if (meta === "alt") {
+      rotation.y += projectedAngle(x) - projectedAngle(mouseStatus.lastPoint.x);
+      rotation.x -= projectedAngle(y) - projectedAngle(mouseStatus.lastPoint.y);
+    } else {
+      translation.x += x - mouseStatus.lastPoint.x;
+      translation.y += y - mouseStatus.lastPoint.y;
+    }
+
+    mouseStatus.lastPoint = point;
+    mouseStatus.lastTimeMs = now;
+
+    (window as any).DEBUG_INFO = { translation, zoom, rotation };
   });
 
-  const cellPipeline = device.createRenderPipeline({
-    label: "Cell pipeline",
-    layout: "auto",
-    vertex: {
-      module: shader,
-      entryPoint: "vertexMain",
-      buffers: [vertexBufferLayout],
-    },
-    fragment: {
-      module: shader,
-      entryPoint: "fragmentMain",
-      targets: [
-        {
-          format,
-        },
-      ],
-    },
-  });
+  const cameraMatrix = new Float32Array(16);
 
-  const bindGroups = [
-    device.createBindGroup({
-      label: "Cell renderer bind group A",
-      layout: cellPipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: uniformBuffer },
-        },
-        {
-          binding: 1,
-          resource: { buffer: cellStateStorage[0] },
-        },
-      ],
-    }),
-    device.createBindGroup({
-      label: "Cell renderer bind group B",
-      layout: cellPipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: uniformBuffer },
-        },
-        {
-          binding: 1,
-          resource: { buffer: cellStateStorage[1] },
-        },
-      ],
-    }),
-  ];
+  const renderImpl = renderUsingQuads(props, splatDataBuffer);
 
-  let step = 0;
   function render() {
-    step++;
+    // const theta = step * 0.005;
 
-    const encoder = device.createCommandEncoder();
+    new MutatingMatrix(cameraMatrix)
+      .reset()
+      .scale(1, -1, 1)
+      .rotateAroundX(rotation.x)
+      .rotateAroundY(rotation.y)
+      .rotateAroundZ(rotation.z)
+      .scale(zoom.x, zoom.y, zoom.z)
+      .translate(translation.x, translation.y, translation.z)
+      .transpose();
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: context.getCurrentTexture().createView(),
-          loadOp: "clear",
-          clearValue: { r: 0, g: 0, b: 0.4, a: 1 },
-          storeOp: "store",
-        },
-      ],
-    });
+    renderImpl(numSplats, cameraMatrix);
 
-    pass.setPipeline(cellPipeline);
-    pass.setVertexBuffer(0, vertexBuffer);
-    pass.setBindGroup(0, bindGroups[step % 2]);
-    pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE);
-
-    pass.end();
-
-    device.queue.submit([encoder.finish()]);
-
-    if (step > 100) clearInterval(interval);
+    if (renderUntil > Date.now()) {
+      requestAnimationFrame(render);
+    } else {
+      renderUntil = 0;
+    }
   }
 
-  const interval = setInterval(render, 200);
+  render();
 }
