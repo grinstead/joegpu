@@ -155,7 +155,7 @@ fn vertex_main(in: GaussianSplat) -> VertexOutput {
   let JW = mat4x4<f32>(
     1 / z, 0, 0, 0,
     0, 1 / z, 0, 0,
-    -1 / z / z, -1 / z / z, 0, 0,
+    -camera_space_origin.x / z / z, -camera_space_origin.y / z / z, 0, 0,
     0, 0, 0, 0,
   ) * render_params.projectionMat; 
 

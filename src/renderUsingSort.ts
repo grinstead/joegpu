@@ -110,7 +110,7 @@ fn projectGaussians(
   let JW = mat4x4<f32>(
     1 / z, 0, 0, 0,
     0, 1 / z, 0, 0,
-    -1 / z / z, -1 / z / z, 0, 0,
+    -camera_space_origin.x / z / z, -camera_space_origin.y / z / z, 0, 0,
     0, 0, 0, 0,
   ) * camera; 
 
@@ -149,27 +149,38 @@ fn renderGaussians(
     let in = renderables[i];
     let origin = in.origin;
 
-    let centered = coords - origin.xy;
-
-    if (length(centered) < .01) {
-      let splatColor = vec4<f32>(
-        in.color.xyz,
-        1,
-      ); 
-      color = splatColor;
+    if (origin.z < 0.01) {
+      continue;
     }
 
-    // let power = -.5 * dot(centered, Σ_prime_inv * centered);
-    // if (power < 0) {
-    //   let alpha = min(.99, exp(power) * normalize_opacity(in.opacity));
-    //   let splatColor = vec4<f32>(
-    //     in.color_sh0 * HARMONIC_COEFF0 + .5,
-    //     1,
-    //   );
+    var centered = coords - origin.xy;
 
-    //   color = (1 - alpha) * color + alpha * splatColor;
-    //   // color = vec4f(0, alpha, 0, 1);
+    if (length(centered) > .1) {
+      continue;
+    }
+
+    centered = 100 * centered;
+
+    // if (length(centered) < .01) {
+    //   let splatColor = vec4<f32>(
+    //     in.color.xyz,
+    //     1,
+    //   ); 
+    //   color = splatColor;
     // }
+
+    let Σ_prime_inv = mat2x2f(
+      in.Σ_inv.x, in.Σ_inv.y,
+      in.Σ_inv.y, in.Σ_inv.z
+    );
+
+    let power = -.5 * dot(centered, Σ_prime_inv * centered);
+    if (power < 0) {
+      let alpha = min(.99, exp(power) * in.color.w);
+
+      color = (1 - alpha) * color + alpha * in.color;
+      // color = vec4f(0, alpha, 0, 1);
+    }
   }
 
   textureStore(outputTexture, pixel.xy, color);

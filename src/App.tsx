@@ -53,9 +53,9 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
 
   let numSplats =
     (fileBytes.byteLength - bodyIndex) / NUM_BYTES_FLOAT32 / NUM_PROPERTIES_PLY;
-  numSplats = Math.min(numSplats, 1000);
+  // numSplats = Math.min(numSplats, 1000);
 
-  const USE_OLD_RENDER = false;
+  const USE_OLD_RENDER = true;
 
   const splatDataBuffer = device.createBuffer({
     label: "Splat Data",
