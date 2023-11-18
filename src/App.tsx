@@ -51,16 +51,27 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
 
   const { device, canvas } = props;
 
+  let numSplats =
+    (fileBytes.byteLength - bodyIndex) / NUM_BYTES_FLOAT32 / NUM_PROPERTIES_PLY;
+  numSplats = Math.min(numSplats, 1000);
+
+  const USE_OLD_RENDER = false;
+
   const splatDataBuffer = device.createBuffer({
     label: "Splat Data",
-    size: fileBytes.byteLength - bodyIndex,
-    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    size: numSplats * NUM_BYTES_FLOAT32 * NUM_PROPERTIES_PLY,
+    usage: USE_OLD_RENDER
+      ? GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+      : GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
   });
 
-  const numSplats =
-    (fileBytes.byteLength - bodyIndex) / NUM_BYTES_FLOAT32 / NUM_PROPERTIES_PLY;
-
-  device.queue.writeBuffer(splatDataBuffer, 0, fileBytes, bodyIndex);
+  device.queue.writeBuffer(
+    splatDataBuffer,
+    0,
+    fileBytes,
+    bodyIndex,
+    numSplats * NUM_BYTES_FLOAT32 * NUM_PROPERTIES_PLY
+  );
 
   const CANVAS_RADIUS = 256;
 
@@ -144,7 +155,10 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
 
   const cameraMatrix = new Float32Array(16);
 
-  const renderImpl = renderUsingSort(props, splatDataBuffer);
+  const renderImpl = (USE_OLD_RENDER ? renderUsingQuads : renderUsingSort)(
+    props,
+    splatDataBuffer
+  );
 
   function render() {
     new MutatingMatrix(cameraMatrix)

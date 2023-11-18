@@ -175,7 +175,7 @@ fn vertex_main(in: GaussianSplat) -> VertexOutput {
   let mid = 0.5 * (Σ_prime_full[0][0] + Σ_prime_full[1][1]);
   let sqrtThing = sqrt(max(0.1, mid * mid - det));
   let radius_camera_space = 3 * sqrt(sqrtThing) / 256.;
-  // let radius_camera_space = .01;
+  // let radius_camera_space = .5;
 
   var out: VertexOutput;
   out.position = vec4<f32>(
