@@ -7,48 +7,7 @@ import { findString } from "./searchBytes.ts";
 import { NUM_PROPERTIES_PLY } from "./ply.ts";
 import { renderUsingQuads } from "./renderUsingQuads.ts";
 import { MutatingMatrix } from "./matrix.ts";
-
-/*
-
-x^T sigma^-1 x
-            (a b 0)   (x)
-(x, y, z) * (e f 0) * (y)
-            (0 0 0)   (z)
-
-            ->
-            (ax + by)
-(x, y, z) * (ex + fy)
-            (0)
-           ->
-
-(ax + by)x + (ex + fy)y
-
-  ->
-
-ax^2 + bxy + exy + fy^2
-
-ax^2 + (b + e)xy + fy^2
-
-
-
-(a b c)
-(. f g)
-(. . j)
-
-(a b c 0)
-(b f g 0)
-(c g j 0)
-(0 0 0 0)
-
-
-sqrt(max(0.1, mid * mid - det));
-
-mid = average of the two standard deviations
-
-determinant =  // a * c - b * b 
-
-
-*/
+import { renderUsingSort } from "./renderUsingSort.ts";
 
 type Point = { x: number; y: number };
 
@@ -185,7 +144,7 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
 
   const cameraMatrix = new Float32Array(16);
 
-  const renderImpl = renderUsingQuads(props, splatDataBuffer);
+  const renderImpl = renderUsingSort(props, splatDataBuffer);
 
   function render() {
     new MutatingMatrix(cameraMatrix)
