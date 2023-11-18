@@ -33,7 +33,7 @@ struct GaussianSplat {
   color_rest: array<vec3f, 15>,
   opacity: f32,
   scales: vec3f,
-  quarternion: vec4f,
+  quaternion: vec4f,
 }
 
 struct ProjectedGaussian {
@@ -82,27 +82,32 @@ fn projectGaussians(
   let camera_space_origin = camera * vec4<f32>(in.origin, 1.0);
   let z = camera_space_origin.z;
 
-  // quarternion to matrix formula taken from
+  // quaternion to matrix formula taken from
   // https://automaticaddison.com/how-to-convert-a-quaternion-to-a-rotation-matrix/
-  let q0 = in.quarternion[0];
-  let q1 = in.quarternion[1];
-  let q2 = in.quarternion[2];
-  let q3 = in.quarternion[3];
+  let qr = in.quaternion[0];
+  let qi = in.quaternion[1];
+  let qj = in.quaternion[2];
+  let qk = in.quaternion[3];
 
   // R (rotation) and S (scales) matrices from Gaussian Splat Paper
   // technically these are the transposed versions because the gpu is col-major order
-  let R = mat4x4<f32>(
-    2*(q0*q0 + q1*q1) - 1, 2*(q1*q2 - q0*q3), 2*(q1*q3 + q0*q2), 0,
-    2*(q1*q2 + q0*q3), 2*(q0*q0 + q2*q2) - 1, 2*(q2*q3 - q0*q1), 0,
-    2*(q1*q3 - q0*q2), 2*(q2*q3 + q0*q1), 2*(q0*q0 + q3*q3) - 1, 0,
-    0, 0, 0, 1
-  );
   let SR_T = mat4x4<f32>(
-    exp(in.scales[0]), 0, 0, 0,
-    0, exp(in.scales[1]), 0, 0,
-    0, 0, exp(in.scales[2]), 0,
-    0, 0, 0, 1,
-  ) * R;
+    // exp(in.scales[0]), 0, 0, 0,
+    // 0, exp(in.scales[1]), 0, 0,
+    // 0, 0, exp(in.scales[2]), 0,
+    .01, 0, 0, 0,
+    0, .01, 0, 0,
+    0, 0, .01, 0,
+    0, 0, 0, 0,
+  ) * mat4x4<f32>(
+    // 1 - 2*(qj*qj + qk*qk), 2*(qi*qj - qk*qr), 2*(qi*qk + qj*qr), 0,
+    // 2*(qi*qj + qk*qr), 1 - 2*(qi*qi + qk*qk), 2*(qj*qk - qi*qr), 0,
+    // 2*(qi*qk - qj*qr), 2*(qj*qk + qi*qr), 1 - 2*(qi*qi + qj*qj), 0,
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 0,
+  );
 
   // Σ is from Gaussian Splat paper (section 4, eq. 6)
   let Σ = transpose(SR_T) * SR_T;
@@ -149,7 +154,7 @@ fn renderGaussians(
     let in = renderables[i];
     let origin = in.origin;
 
-    if (origin.z < 0.01) {
+    if (origin.z < 0.1) {
       continue;
     }
 
@@ -159,7 +164,7 @@ fn renderGaussians(
       continue;
     }
 
-    centered = 100 * centered;
+    // centered = 100 * centered;
 
     // if (length(centered) < .01) {
     //   let splatColor = vec4<f32>(
@@ -169,18 +174,20 @@ fn renderGaussians(
     //   color = splatColor;
     // }
 
-    let Σ_prime_inv = mat2x2f(
+    let Σ_inv = mat2x2f(
       in.Σ_inv.x, in.Σ_inv.y,
       in.Σ_inv.y, in.Σ_inv.z
     );
 
-    let power = -.5 * dot(centered, Σ_prime_inv * centered);
-    if (power < 0) {
-      let alpha = min(.99, exp(power) * in.color.w);
-
-      color = (1 - alpha) * color + alpha * in.color;
-      // color = vec4f(0, alpha, 0, 1);
+    let power = -.5 * dot(centered, Σ_inv * centered);
+    if (power > 0) {
+      continue;
     }
+
+    let alpha = min(.99, exp(power) * in.color.w);
+
+    color = (1 - alpha) * color + alpha * in.color;
+    // color = vec4f(0, alpha, 0, 1);
   }
 
   textureStore(outputTexture, pixel.xy, color);

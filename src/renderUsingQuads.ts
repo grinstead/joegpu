@@ -123,27 +123,27 @@ fn normalize_opacity(in: f32) -> f32 {
 }
 
 @vertex
-fn vertex_main(in: GaussianSplat) -> VertexOutput {
+fn vertex_main(in: GaussianSplat, @builtin(instance_index) index: u32) -> VertexOutput {
   // quarternion to matrix formula taken from
-  // https://automaticaddison.com/how-to-convert-a-quaternion-to-a-rotation-matrix/
-  let q0 = in.quarternion[0];
-  let q1 = in.quarternion[1];
-  let q2 = in.quarternion[2];
-  let q3 = in.quarternion[3];
+  // https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation
+  let qr = in.quarternion[0];
+  let qi = in.quarternion[1];
+  let qj = in.quarternion[2];
+  let qk = in.quarternion[3];
 
   // R (rotation) and S (scales) matrices from Gaussian Splat Paper
   // technically these are the transposed versions because the gpu is col-major order
   let R = mat4x4<f32>(
-    2*(q0*q0 + q1*q1) - 1, 2*(q1*q2 - q0*q3), 2*(q1*q3 + q0*q2), 0,
-    2*(q1*q2 + q0*q3), 2*(q0*q0 + q2*q2) - 1, 2*(q2*q3 - q0*q1), 0,
-    2*(q1*q3 - q0*q2), 2*(q2*q3 + q0*q1), 2*(q0*q0 + q3*q3) - 1, 0,
-    0, 0, 0, 1
+    1 - 2*(qj*qj + qk*qk), 2*(qi*qj - qk*qr), 2*(qi*qk + qj*qr), 0,
+    2*(qi*qj + qk*qr), 1 - 2*(qi*qi + qk*qk), 2*(qj*qk - qi*qr), 0,
+    2*(qi*qk - qj*qr), 2*(qj*qk + qi*qr), 1 - 2*(qi*qi + qj*qj), 0,
+    0, 0, 0, 0,
   );
   let SR_T = mat4x4<f32>(
     exp(in.scales[0]), 0, 0, 0,
     0, exp(in.scales[1]), 0, 0,
     0, 0, exp(in.scales[2]), 0,
-    0, 0, 0, 1,
+    0, 0, 0, 0,
   ) * R;
 
   // Σ is from Gaussian Splat paper (section 4, eq. 6)
@@ -174,8 +174,8 @@ fn vertex_main(in: GaussianSplat) -> VertexOutput {
 
   let mid = 0.5 * (Σ_prime_full[0][0] + Σ_prime_full[1][1]);
   let sqrtThing = sqrt(max(0.1, mid * mid - det));
-  let radius_camera_space = 3 * sqrt(sqrtThing) / 256.;
-  // let radius_camera_space = .5;
+  let radius_camera_space = 3 * sqrt(sqrtThing) / 100.;
+  // let radius_camera_space = .1;
 
   var out: VertexOutput;
   out.position = vec4<f32>(
@@ -191,7 +191,7 @@ fn vertex_main(in: GaussianSplat) -> VertexOutput {
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
-  if (in.position.z < .005) {
+  if (in.position.z < .0005) {
     discard;
   }
 
