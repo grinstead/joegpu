@@ -8,6 +8,8 @@ export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
   const screenShader = device.createShaderModule({
     label: "Single Texture Shader",
     code: `
+@group(0) @binding(0) var screenSampler: sampler;
+@group(0) @binding(1) var screenTexture: texture_2d<f32>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -33,12 +35,29 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 
 @fragment
 fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
-  return vec4f(0, fragUV, 1);
+  let fromTexture = textureSample(screenTexture, screenSampler, fragUV);
+
+  // currently mixing in other colors just to confirm things are rendering
+  return (fromTexture + vec4f(0, fragUV, 1)) * .5;
 }   
 `,
   });
 
-  const pipeline = device.createRenderPipeline({
+  const outputSampler = device.createSampler({
+    label: "Basic Texture Sampler",
+  });
+
+  const outputTexture = device.createTexture({
+    label: "Splat Output Texture",
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    format: "rgba8unorm",
+    size: {
+      width: canvas.width,
+      height: canvas.height,
+    },
+  });
+
+  const renderPipeline = device.createRenderPipeline({
     layout: "auto",
     vertex: {
       module: screenShader,
@@ -56,6 +75,17 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
   const encoder = device.createCommandEncoder();
 
+  const renderTextureBindGroup = device.createBindGroup({
+    layout: renderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: outputSampler },
+      {
+        binding: 1,
+        resource: outputTexture.createView(),
+      },
+    ],
+  });
+
   return render;
 
   function render(numSplats: number, cameraMatrix: Float32Array) {
@@ -69,7 +99,8 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       ],
     });
 
-    pass.setPipeline(pipeline);
+    pass.setPipeline(renderPipeline);
+    pass.setBindGroup(0, renderTextureBindGroup);
     pass.draw(4);
     pass.end();
 
