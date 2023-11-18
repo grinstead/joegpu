@@ -332,9 +332,11 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     ],
   });
 
-  const encoder = device.createCommandEncoder();
+  return render;
 
   function render(numSplats: number, cameraMatrix: Float32Array) {
+    const encoder = device.createCommandEncoder();
+
     device.queue.writeBuffer(
       cameraBuffer,
       0,
@@ -370,6 +372,4 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     device.queue.submit([encoder.finish()]);
   }
-
-  return render;
 }
