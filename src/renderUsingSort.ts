@@ -36,9 +36,16 @@ struct GaussianSplat {
   quarternion: vec4f,
 }
 
+struct ProjectedGaussian {
+  origin: vec3f,
+  Σ_inv: vec3f,
+  color: vec4f,
+}
+
 @group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(0) var<storage> gaussians: array<GaussianSplat>;
 @group(1) @binding(1) var<uniform> camera: mat4x4f; 
+@group(1) @binding(2) var<storage> screenSpaceGaussians: array<ProjectedGaussian>;
 
 override chunkSize: u32 = 16;
 
@@ -66,7 +73,7 @@ fn renderGaussians(
   @builtin(local_invocation_id) offset: vec3u,
   @builtin(global_invocation_id) pixel: vec3u,
 ) {
-  
+  _ = screenSpaceGaussians[0];
   let coords = 2 * vec2f(pixel.xy) / vec2f(textureDimensions(outputTexture)) - 1;
 
   var color = vec4f(.1, .1, .1, 0);
@@ -172,13 +179,9 @@ fn renderGaussians(
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  const guassianDataBindGroup = device.createBindGroup({
-    layout: guassianPipeline.getBindGroupLayout(1),
-    entries: [
-      { binding: 0, resource: { buffer: splatData } },
-      { binding: 1, resource: { buffer: cameraBuffer } },
-    ],
-  });
+  let projectedGaussianBufferSize = 0;
+  let projectedGaussianBuffer: undefined | GPUBuffer;
+  let guassianDataBindGroup: undefined | GPUBindGroup;
 
   // creates a shader that needs to draw 4 points, one for each corner of the screen
   const outputShader = device.createShaderModule({
@@ -265,10 +268,32 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       cameraMatrix.byteLength
     );
 
+    if (numSplats !== projectedGaussianBufferSize) {
+      if (projectedGaussianBuffer) {
+        projectedGaussianBuffer.destroy();
+      }
+
+      projectedGaussianBuffer = device.createBuffer({
+        label: `Projected Gaussians (${numSplats})`,
+        size: numSplats * 10 * NUM_BYTES_FLOAT32,
+        usage: GPUBufferUsage.STORAGE,
+      });
+
+      guassianDataBindGroup = device.createBindGroup({
+        label: "Specific Gaussian Data to Render",
+        layout: guassianPipeline.getBindGroupLayout(1),
+        entries: [
+          { binding: 0, resource: { buffer: splatData } },
+          { binding: 1, resource: { buffer: cameraBuffer } },
+          { binding: 2, resource: { buffer: projectedGaussianBuffer } },
+        ],
+      });
+    }
+
     const guassianPass = encoder.beginComputePass();
     guassianPass.setPipeline(guassianPipeline);
     guassianPass.setBindGroup(0, guassianBindGroup);
-    guassianPass.setBindGroup(1, guassianDataBindGroup);
+    guassianPass.setBindGroup(1, guassianDataBindGroup!);
     guassianPass.dispatchWorkgroups(chunkDims.x, chunkDims.y);
     guassianPass.end();
 
