@@ -4,10 +4,9 @@ import { GPUCanvas, GPUCanvasDetails, createGPUCanvas } from "./GPUCanvas";
 import { NUM_BYTES_FLOAT32, Result } from "./utils";
 import exampleDataUrl from "./assets/example.ply?url";
 import { findString } from "./searchBytes.ts";
-import { MutatingMatrix } from "./matrix.ts";
-import { QUAD_VERTICES } from "./gpu_utils.ts";
-import { renderUsingQuads } from "./renderUsingQuads.ts";
 import { NUM_PROPERTIES_PLY } from "./ply.ts";
+import { renderUsingQuads } from "./renderUsingQuads.ts";
+import { MutatingMatrix } from "./matrix.ts";
 
 /*
 
@@ -189,8 +188,6 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
   const renderImpl = renderUsingQuads(props, splatDataBuffer);
 
   function render() {
-    // const theta = step * 0.005;
-
     new MutatingMatrix(cameraMatrix)
       .reset()
       .scale(1, -1, 1)
