@@ -75,10 +75,12 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 
   let fragXY = fragPoints[index];
 
-  var output: VertexOutput;
-  output.position = vec4f(2 * fragXY - 1, 0, 1);
-  output.fragmentXY = fragXY;
-  return output;
+  return VertexOutput(
+    // position
+    vec4f(2 * fragXY - 1, 0, 1),
+    // fragmentXY
+    fragXY,
+  );
 }
 
 @fragment
