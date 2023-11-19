@@ -82,7 +82,7 @@ override blockSize: u32 = 16;
 fn projectGaussians(
   @builtin(global_invocation_id) index: vec3u,
 ) {
-  if (index.x > arrayLength(&gaussians)) {
+  if (index.x >= arrayLength(&gaussians)) {
     return;
   }
 
@@ -431,7 +431,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
       projectedGaussianBuffer = device.createBuffer({
         label: `Projected Gaussians (${numSplats})`,
-        size: numSplats * 10 * NUM_BYTES_FLOAT32,
+        size: numSplats * 12 * NUM_BYTES_FLOAT32,
         usage: GPUBufferUsage.STORAGE,
       });
 
