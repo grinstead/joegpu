@@ -4,6 +4,13 @@ import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
 
+const SLICE_DEF = `
+struct Slice {
+  offset: u32,
+  length: u32,
+}
+`;
+
 const PROJECTED_GUASSIAN_DEF = `
 struct ProjectedGaussian {
   origin: vec3f,
@@ -50,12 +57,14 @@ struct GaussianSplat {
 }
 
 ${PROJECTED_GUASSIAN_DEF}
+${SLICE_DEF}
 
 const HARMONIC_COEFF0: f32 = 0.28209479177387814;
 
 @group(0) @binding(0) var<storage> gaussians: array<GaussianSplat>;
 @group(0) @binding(1) var<uniform> camera: mat4x4f; 
 @group(0) @binding(2) var<storage, read_write> projectedGaussians: array<ProjectedGaussian>;
+@group(0) @binding(3) var<uniform> slice: Slice;
 
 fn invert_2x2(input: mat2x2<f32>) -> mat2x2<f32> {
   return (1 / determinant(input)) * mat2x2<f32>(
@@ -82,11 +91,11 @@ override blockSize: u32 = 16;
 fn projectGaussians(
   @builtin(global_invocation_id) index: vec3u,
 ) {
-  if (index.x >= arrayLength(&gaussians)) {
+  if (index.x >= slice.length) {
     return;
   }
 
-  let in = gaussians[index.x];
+  let in = gaussians[index.x + slice.offset];
 
   let camera_space_origin = camera * vec4<f32>(in.origin[0], in.origin[1], in.origin[2], 1.0);
   let z = camera_space_origin.z;
@@ -161,11 +170,7 @@ fn projectGaussians(
         label: "Radix Sort Histogram Computation",
         code: `
 ${PROJECTED_GUASSIAN_DEF}
-
-struct Slice {
-  offset: u32,
-  length: u32,
-};
+${SLICE_DEF}
 
 const NUM_BITS_PER_BUCKET: u32 = 8;
 const NUM_PASSES: u32 = 32 / NUM_BITS_PER_BUCKET;
@@ -255,7 +260,7 @@ fn computeBinSizes(
     size: NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
   });
-  const binSizingSliceBuffer = device.createBuffer({
+  const dataSliceBuffer = device.createBuffer({
     size: 2 * NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
   });
@@ -268,9 +273,11 @@ fn computeBinSizes(
         label: "Gaussian Splatting Shader",
         code: `
 ${PROJECTED_GUASSIAN_DEF}
+${SLICE_DEF}
 
 @group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(0) var<storage> renderables: array<ProjectedGaussian>;
+@group(1) @binding(1) var<uniform> slice: Slice;
 
 override chunkSize: u32 = 16;
 
@@ -280,11 +287,11 @@ fn renderGaussians(
   @builtin(local_invocation_id) offset: vec3u,
   @builtin(global_invocation_id) pixel: vec3u,
 ) {
-  let numGaussians = arrayLength(&renderables);
   let coords = 2 * vec2f(pixel.xy) / vec2f(textureDimensions(outputTexture)) - 1;
   var color = vec4f(.1, .1, .1, 0);
 
-  for (var i: u32 = 0; i < numGaussians; i++) {
+  let end = slice.offset + slice.length;
+  for (var i = slice.offset; i < end; i++) {
     let in = renderables[i];
     let origin = in.origin;
 
@@ -443,6 +450,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
             { binding: 0, resource: { buffer: splatData } },
             { binding: 1, resource: { buffer: cameraBuffer } },
             { binding: 2, resource: { buffer: projectedGaussianBuffer } },
+            { binding: 3, resource: { buffer: dataSliceBuffer } },
           ],
         }),
       ];
@@ -453,7 +461,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           layout: binSizingPipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffer } },
-            { binding: 1, resource: { buffer: binSizingSliceBuffer } },
+            { binding: 1, resource: { buffer: dataSliceBuffer } },
             { binding: 2, resource: { buffer: histogramBuffer } },
             { binding: 3, resource: { buffer: binPackingInputBuffer } },
           ],
@@ -466,6 +474,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           layout: guassianPipeline.getBindGroupLayout(1),
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffer } },
+            { binding: 1, resource: { buffer: dataSliceBuffer } },
           ],
         }),
       ];
@@ -487,7 +496,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
     writeToBuffer(
       device.queue,
-      binSizingSliceBuffer,
+      dataSliceBuffer,
       new Uint32Array([0, numSplats])
     );
 
