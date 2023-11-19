@@ -50,7 +50,6 @@ ${PROJECTED_GUASSIAN_DEF}
 
 const HARMONIC_COEFF0: f32 = 0.28209479177387814;
 
-
 @group(0) @binding(0) var<storage> gaussians: array<GaussianSplat>;
 @group(0) @binding(1) var<uniform> camera: mat4x4f; 
 @group(0) @binding(2) var<storage, read_write> projectedGaussians: array<ProjectedGaussian>;
@@ -141,6 +140,35 @@ fn projectGaussians(
     },
   });
 
+  const binSizingPipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      entryPoint: "computeBinSizes",
+      module: device.createShaderModule({
+        label: "Radix Sort Histogram Computation",
+        code: `
+${PROJECTED_GUASSIAN_DEF}
+
+@group(0) @binding(0) var<storage> gaussians: array<ProjectedGaussian>;
+// @group(0) @binding(1) var<storage> histogramSizes: array<array<u
+
+// var<storage> histogramSizes: array<array<u32, 256>, 4>;
+
+override chunkSize: u32 = 128;
+override itemsPerThreadPerTile: u32 = 16;
+
+// currently do nothing
+@compute @workgroup_size(chunkSize)
+fn computeBinSizes(
+
+) {
+  _ = gaussians[0];
+}
+  `,
+      }),
+    },
+  });
+
   const guassianPipeline = device.createComputePipeline({
     layout: "auto",
     compute: {
@@ -211,6 +239,7 @@ fn renderGaussians(
   let projectedGaussianBufferSize = 0;
   let projectedGaussianBuffer: undefined | GPUBuffer;
   let projectedDataBindGroups: undefined | Array<GPUBindGroup>;
+  let binSizingDataBindGroups: undefined | Array<GPUBindGroup>;
   let renderDataBindGroups: undefined | Array<GPUBindGroup>;
 
   // creates a shader that needs to draw 4 points, one for each corner of the screen
@@ -321,6 +350,16 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         }),
       ];
 
+      binSizingDataBindGroups = [
+        device.createBindGroup({
+          label: "Bin Sizing Data",
+          layout: binSizingPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: projectedGaussianBuffer } },
+          ],
+        }),
+      ];
+
       renderDataBindGroups = [
         guassianBindGroup,
         device.createBindGroup({
@@ -339,6 +378,15 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     });
     projectionPass.dispatchWorkgroups(Math.ceil(numSplats / CHUNK_SIZE));
     projectionPass.end();
+
+    const binSizingPass = encoder.beginComputePass();
+    binSizingPass.setPipeline(binSizingPipeline);
+    binSizingDataBindGroups!.forEach((group, i) => {
+      binSizingPass.setBindGroup(i, group);
+    });
+    // the number should be proportional to the number of gpu cores
+    binSizingPass.dispatchWorkgroups(64);
+    binSizingPass.end();
 
     const guassianPass = encoder.beginComputePass();
     guassianPass.setPipeline(guassianPipeline);
