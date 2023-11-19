@@ -74,7 +74,7 @@ fn normalize_opacity(in: f32) -> f32 {
 }
 
 // todo: make this overridable maybe?
-const chunkDims = vec2f(16. / 512, 16. / 512) / 2.;
+const chunkDims = vec2f(16. / 512, 16. / 512);
 const chunksPerRow = u32(1. / chunkDims.y);
 
 override blockSize: u32 = 16;
@@ -140,7 +140,7 @@ fn projectGaussians(
 
   projectedGaussians[index.x] = ProjectedGaussian(
     screenSpace,
-    chunkId.x + chunkId.y * chunksPerRow,
+    min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -167,9 +167,9 @@ struct Slice {
   length: u32,
 };
 
-const NUM_PASSES = 4;
-const NUM_BITS_PER_BUCKET = 8;
-const NUM_BUCKETS = 256;
+const NUM_BITS_PER_BUCKET: u32 = 8;
+const NUM_PASSES: u32 = 32 / NUM_BITS_PER_BUCKET;
+const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 @group(0) @binding(0) var<storage> gaussians: array<ProjectedGaussian>;
 @group(0) @binding(1) var<uniform> slice: Slice;
@@ -189,11 +189,12 @@ var<workgroup> localHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES
 fn computeBinSizes(
   @builtin(local_invocation_index) localIndex: u32,
 ) {  
+  let tileSize = itemsPerThreadPerTile * blockSize;
+
+  // loop through "tiles"
   loop {
     if (localIndex == 0) {
-      workgroupStart = atomicAdd(
-        &nextTileStart, itemsPerThreadPerTile * blockSize
-      );
+      workgroupStart = atomicAdd(&nextTileStart, tileSize);
     }
 
     let tileStart = workgroupUniformLoad(&workgroupStart);
@@ -201,20 +202,29 @@ fn computeBinSizes(
       break;
     }
 
-    let end = slice.offset + min(
-      slice.length,
-      tileStart + itemsPerThreadPerTile * blockSize
-    );
+    let end = slice.offset + min(slice.length, tileStart + tileSize);
 
-    for (var i: u32 = slice.offset + tileStart; i < end; i += blockSize) {
+    for (
+      var i: u32 = slice.offset + tileStart + localIndex;
+      i < end;
+      i += blockSize
+    ) {
       let key = gaussians[i].sortKey;
       
       for (var round: u32 = 0; round < NUM_PASSES; round++) {
-        atomicAdd(&localHistogram[round][extractBits(key, round * NUM_BITS_PER_BUCKET, (round + 1) * NUM_BITS_PER_BUCKET)], 1);
+        let subkey = extractBits(
+          key,
+          round * NUM_BITS_PER_BUCKET,
+          NUM_BITS_PER_BUCKET
+        );
+        atomicAdd(&localHistogram[round][subkey], 1);
       }
     }
   }
 
+  workgroupBarrier();
+
+  // add to the global histogram at the end
   if (localIndex == 0) {
     for (var round: u32 = 0; round < NUM_PASSES; round++) {
       for (var bucket: u32 = 0; bucket < NUM_BUCKETS; bucket++) {
@@ -329,6 +339,7 @@ fn renderGaussians(
     code: `
 @group(0) @binding(0) var screenSampler: sampler;
 @group(0) @binding(1) var screenTexture: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> debug_histogram: array<array<u32, 256>, 4>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -356,11 +367,23 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 
 @fragment
 fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
-  return textureSample(screenTexture, screenSampler, fragUV);
+  let dim = 16. / 512.;
 
-  // currently mixing in other colors just to confirm things are rendering
-  // return (fromTexture + vec4f(0, fragUV, 1)) * .5;
-}   
+  // let bucket = u32(floor(fragUV.y / dim)) * 32 + u32(floor(fragUV.x / dim));
+  var tint = vec4f(0, 0, 0, 1);
+
+  if (fragUV.x < dim) {
+    tint.x = f32(debug_histogram[1][u32(fragUV.y / dim)]) / 100.;
+  }
+
+  if (fragUV.y < dim) {
+    tint.y = f32(debug_histogram[0][u32(fragUV.x / dim)]) / 100.;
+  }
+
+  let color = textureSample(screenTexture, screenSampler, fragUV);
+  
+  return saturate(tint) * (1 - color.w) + color.w * color;
+}
 `,
   });
 
@@ -392,6 +415,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         binding: 1,
         resource: outputTexture.createView(),
       },
+      { binding: 2, resource: { buffer: histogramBuffer } },
     ],
   });
 
