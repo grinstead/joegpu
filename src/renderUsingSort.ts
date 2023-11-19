@@ -27,13 +27,13 @@ export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
     code: `
 
 struct GaussianSplat {
-  origin: vec3f,
-  normal: vec3f,
-  color_sh0: vec3f,
-  color_rest: array<vec3f, 15>,
+  origin: array<f32, 3>,
+  normal: array<f32, 3>,
+  color_sh0: array<f32, 3>,
+  color_rest: array<array<f32, 3>, 15>,
   opacity: f32,
-  scales: vec3f,
-  quaternion: vec4f,
+  scales: array<f32, 3>,
+  quaternion: array<f32, 4>,
 }
 
 struct ProjectedGaussian {
@@ -79,7 +79,7 @@ fn projectGaussians(
 
   let in = gaussians[index.x];
 
-  let camera_space_origin = camera * vec4<f32>(in.origin, 1.0);
+  let camera_space_origin = camera * vec4<f32>(in.origin[0], in.origin[1], in.origin[2], 1.0);
   let z = camera_space_origin.z;
 
   // quaternion to matrix formula taken from
@@ -92,20 +92,14 @@ fn projectGaussians(
   // R (rotation) and S (scales) matrices from Gaussian Splat Paper
   // technically these are the transposed versions because the gpu is col-major order
   let SR_T = mat4x4<f32>(
-    // exp(in.scales[0]), 0, 0, 0,
-    // 0, exp(in.scales[1]), 0, 0,
-    // 0, 0, exp(in.scales[2]), 0,
-    .01, 0, 0, 0,
-    0, .01, 0, 0,
-    0, 0, .01, 0,
+    exp(in.scales[0]), 0, 0, 0,
+    0, exp(in.scales[1]), 0, 0,
+    0, 0, exp(in.scales[2]), 0,
     0, 0, 0, 0,
   ) * mat4x4<f32>(
-    // 1 - 2*(qj*qj + qk*qk), 2*(qi*qj - qk*qr), 2*(qi*qk + qj*qr), 0,
-    // 2*(qi*qj + qk*qr), 1 - 2*(qi*qi + qk*qk), 2*(qj*qk - qi*qr), 0,
-    // 2*(qi*qk - qj*qr), 2*(qj*qk + qi*qr), 1 - 2*(qi*qi + qj*qj), 0,
-    1, 0, 0, 0,
-    0, 1, 0, 0,
-    0, 0, 1, 0,
+    1 - 2*(qj*qj + qk*qk), 2*(qi*qj - qk*qr), 2*(qi*qk + qj*qr), 0,
+    2*(qi*qj + qk*qr), 1 - 2*(qi*qi + qk*qk), 2*(qj*qk - qi*qr), 0,
+    2*(qi*qk - qj*qr), 2*(qj*qk + qi*qr), 1 - 2*(qi*qi + qj*qj), 0,
     0, 0, 0, 0,
   );
 
@@ -134,7 +128,7 @@ fn projectGaussians(
     vec3f(camera_space_origin.xy / z, z),
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
-      in.color_sh0 * HARMONIC_COEFF0 + .5,
+      vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
       normalize_opacity(in.opacity),
     ),
   );
@@ -159,20 +153,6 @@ fn renderGaussians(
     }
 
     var centered = coords - origin.xy;
-
-    if (length(centered) > .1) {
-      continue;
-    }
-
-    // centered = 100 * centered;
-
-    // if (length(centered) < .01) {
-    //   let splatColor = vec4<f32>(
-    //     in.color.xyz,
-    //     1,
-    //   ); 
-    //   color = splatColor;
-    // }
 
     let Σ_inv = mat2x2f(
       in.Σ_inv.x, in.Σ_inv.y,
