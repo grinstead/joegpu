@@ -6,6 +6,8 @@ const CHUNK_SIZE = 16;
 const PROJECTED_GUASSIAN_DEF = `
 struct ProjectedGaussian {
   origin: vec3f,
+  // placed in here to sneak into otherwise alignment-mandated deadspace
+  sortKey: u32,
   Σ_inv: vec3f,
   color: vec4f,
 }
@@ -70,6 +72,10 @@ fn normalize_opacity(in: f32) -> f32 {
   }
 }
 
+// todo: make this overridable maybe?
+const chunkDims = vec2f(16. / 512, 16. / 512) / 2.;
+const chunksPerRow = u32(1. / chunkDims.y);
+
 override blockSize: u32 = 16;
 @compute @workgroup_size(blockSize)
 fn projectGaussians(
@@ -126,8 +132,14 @@ fn projectGaussians(
     )
   );
 
+  let screenSpace = vec3f(camera_space_origin.xy / z, z);
+  let chunkId = vec2u(
+    saturate((screenSpace.xy + 1) / 2) / chunkDims
+  );
+
   projectedGaussians[index.x] = ProjectedGaussian(
-    vec3f(camera_space_origin.xy / z, z),
+    screenSpace,
+    chunkId.x + chunkId.y * chunksPerRow,
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -153,18 +165,47 @@ const NUM_PASSES = 4;
 const NUM_BUCKETS = 256;
 
 @group(0) @binding(0) var<storage> gaussians: array<ProjectedGaussian>;
-@group(0) @binding(1) var<storage, read_write> histogramSizes: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
 
-override chunkSize: u32 = 128;
+// these should always be empty
+@group(0) @binding(1) var<storage, read_write> histogramSizes: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
+@group(0) @binding(2) var<storage, read_write> nextTileStart: atomic<u32>;
+
+override blockSize: u32 = 128;
 override itemsPerThreadPerTile: u32 = 16;
 
-// currently do nothing
-@compute @workgroup_size(chunkSize)
-fn computeBinSizes(
+var<workgroup> tileStart: u32;
+var<workgroup> localHistogram: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
 
+// currently do nothing
+@compute @workgroup_size(blockSize)
+fn computeBinSizes(
+  @builtin(local_invocation_id) localIndex: vec3u,
 ) {
-  _ = gaussians[0];
   _ = histogramSizes[0][0];
+  
+  let numItems = arrayLength(&gaussians);
+  
+  if (localIndex.x == 0) {
+    tileStart = atomicAdd(
+      &nextTileStart, 
+      itemsPerThreadPerTile * blockSize
+    );
+  }
+
+  workgroupBarrier();
+
+  let end = min(
+    numItems, 
+    tileStart + itemsPerThreadPerTile * blockSize
+  );
+
+  for (var i: u32 = tileStart; i < end; i += blockSize) {
+    let key = gaussians[i].sortKey;
+    
+
+
+  }
+
 }
   `,
       }),
@@ -180,6 +221,10 @@ fn computeBinSizes(
       GPUBufferUsage.COPY_DST |
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.STORAGE,
+  });
+  const binPackingInputBuffer = device.createBuffer({
+    size: NUM_BYTES_UINT32,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
   });
 
   const guassianPipeline = device.createComputePipeline({
@@ -362,6 +407,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffer } },
             { binding: 1, resource: { buffer: histogramBuffer } },
+            { binding: 2, resource: { buffer: binPackingInputBuffer } },
           ],
         }),
       ];
@@ -395,6 +441,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
     // reset the histogram
     encoder.clearBuffer(histogramBuffer);
+    encoder.clearBuffer(binPackingInputBuffer);
 
     const binSizingPass = encoder.beginComputePass();
     binSizingPass.setPipeline(binSizingPipeline);
