@@ -3,6 +3,14 @@ import { NUM_BYTES_FLOAT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
 
+const PROJECTED_GUASSIAN_DEF = `
+struct ProjectedGaussian {
+  origin: vec3f,
+  Σ_inv: vec3f,
+  color: vec4f,
+}
+`;
+
 export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
   const { canvas, context, device, format } = props;
 
@@ -21,11 +29,13 @@ export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
     },
   });
 
-  // This shader renders the guassian splats to a texture
-  const gaussianShader = device.createShaderModule({
-    label: "Gaussian Splatting Shader",
-    code: `
-
+  const projectGaussiansPipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      entryPoint: "projectGaussians",
+      module: device.createShaderModule({
+        label: "Guassian Projection Shader",
+        code: `
 struct GaussianSplat {
   origin: array<f32, 3>,
   normal: array<f32, 3>,
@@ -36,22 +46,14 @@ struct GaussianSplat {
   quaternion: array<f32, 4>,
 }
 
-struct ProjectedGaussian {
-  origin: vec3f,
-  Σ_inv: vec3f,
-  color: vec4f,
-}
-
-@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;
-@group(1) @binding(0) var<storage> gaussians: array<GaussianSplat>;
-@group(1) @binding(1) var<uniform> camera: mat4x4f; 
-@group(1) @binding(2) var<storage, read_write> projectedGaussians: array<ProjectedGaussian>;
-@group(2) @binding(0) var<storage> renderables: array<ProjectedGaussian>;
-
-override chunkSize: u32 = 16;
-override projectionChunkSize: u32 = 16;
+${PROJECTED_GUASSIAN_DEF}
 
 const HARMONIC_COEFF0: f32 = 0.28209479177387814;
+
+
+@group(0) @binding(0) var<storage> gaussians: array<GaussianSplat>;
+@group(0) @binding(1) var<uniform> camera: mat4x4f; 
+@group(0) @binding(2) var<storage, read_write> projectedGaussians: array<ProjectedGaussian>;
 
 fn invert_2x2(input: mat2x2<f32>) -> mat2x2<f32> {
   return (1 / determinant(input)) * mat2x2<f32>(
@@ -69,7 +71,8 @@ fn normalize_opacity(in: f32) -> f32 {
   }
 }
 
-@compute @workgroup_size(projectionChunkSize)
+override blockSize: u32 = 16;
+@compute @workgroup_size(blockSize)
 fn projectGaussians(
   @builtin(global_invocation_id) index: vec3u,
 ) {
@@ -133,6 +136,24 @@ fn projectGaussians(
     ),
   );
 }
+        `,
+      }),
+    },
+  });
+
+  const guassianPipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      entryPoint: "renderGaussians",
+      module: device.createShaderModule({
+        label: "Gaussian Splatting Shader",
+        code: `
+${PROJECTED_GUASSIAN_DEF}
+
+@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(0) var<storage> renderables: array<ProjectedGaussian>;
+
+override chunkSize: u32 = 16;
 
 @compute @workgroup_size(chunkSize, chunkSize)
 fn renderGaussians(
@@ -172,22 +193,8 @@ fn renderGaussians(
 
   textureStore(outputTexture, pixel.xy, color);
 }
-`,
-  });
-
-  const projectGaussiansPipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: {
-      module: gaussianShader,
-      entryPoint: "projectGaussians",
-    },
-  });
-
-  const guassianPipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: {
-      module: gaussianShader,
-      entryPoint: "renderGaussians",
+    `,
+      }),
     },
   });
 
@@ -304,12 +311,8 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
       projectedDataBindGroups = [
         device.createBindGroup({
+          label: "Specific Gaussian Data to Project onto Screen Space",
           layout: projectGaussiansPipeline.getBindGroupLayout(0),
-          entries: [],
-        }),
-        device.createBindGroup({
-          label: "Specific Gaussian Data to Render",
-          layout: projectGaussiansPipeline.getBindGroupLayout(1),
           entries: [
             { binding: 0, resource: { buffer: splatData } },
             { binding: 1, resource: { buffer: cameraBuffer } },
@@ -322,10 +325,6 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         guassianBindGroup,
         device.createBindGroup({
           layout: guassianPipeline.getBindGroupLayout(1),
-          entries: [],
-        }),
-        device.createBindGroup({
-          layout: guassianPipeline.getBindGroupLayout(2),
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffer } },
           ],
@@ -366,6 +365,4 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
     device.queue.submit([encoder.finish()]);
   }
-
-  return render;
 }
