@@ -1,4 +1,5 @@
 export const NUM_BYTES_FLOAT32 = 4;
+export const NUM_BYTES_UINT32 = 4;
 
 export type Result<T, Error = unknown> =
   | {
