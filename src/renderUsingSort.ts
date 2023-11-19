@@ -1,4 +1,5 @@
 import { GPUCanvasDetails } from "./GPUCanvas.tsx";
+import { writeToBuffer } from "./gpu_utils.ts";
 import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
@@ -161,51 +162,69 @@ fn projectGaussians(
         code: `
 ${PROJECTED_GUASSIAN_DEF}
 
+struct Slice {
+  offset: u32,
+  length: u32,
+};
+
 const NUM_PASSES = 4;
+const NUM_BITS_PER_BUCKET = 8;
 const NUM_BUCKETS = 256;
 
 @group(0) @binding(0) var<storage> gaussians: array<ProjectedGaussian>;
+@group(0) @binding(1) var<uniform> slice: Slice;
 
 // these should always be empty
-@group(0) @binding(1) var<storage, read_write> histogramSizes: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
-@group(0) @binding(2) var<storage, read_write> nextTileStart: atomic<u32>;
+@group(0) @binding(2) var<storage, read_write> globalHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES>;
+@group(0) @binding(3) var<storage, read_write> nextTileStart: atomic<u32>;
 
 override blockSize: u32 = 128;
 override itemsPerThreadPerTile: u32 = 16;
 
-var<workgroup> tileStart: u32;
-var<workgroup> localHistogram: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
+var<workgroup> workgroupStart: u32;
+var<workgroup> localHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES>;
 
 // currently do nothing
 @compute @workgroup_size(blockSize)
 fn computeBinSizes(
-  @builtin(local_invocation_id) localIndex: vec3u,
-) {
-  _ = histogramSizes[0][0];
-  
-  let numItems = arrayLength(&gaussians);
-  
-  if (localIndex.x == 0) {
-    tileStart = atomicAdd(
-      &nextTileStart, 
-      itemsPerThreadPerTile * blockSize
+  @builtin(local_invocation_index) localIndex: u32,
+) {  
+  loop {
+    if (localIndex == 0) {
+      workgroupStart = atomicAdd(
+        &nextTileStart, itemsPerThreadPerTile * blockSize
+      );
+    }
+
+    let tileStart = workgroupUniformLoad(&workgroupStart);
+    if (tileStart >= slice.length) {
+      break;
+    }
+
+    let end = slice.offset + min(
+      slice.length,
+      tileStart + itemsPerThreadPerTile * blockSize
     );
+
+    for (var i: u32 = slice.offset + tileStart; i < end; i += blockSize) {
+      let key = gaussians[i].sortKey;
+      
+      for (var round: u32 = 0; round < NUM_PASSES; round++) {
+        atomicAdd(&localHistogram[round][extractBits(key, round * NUM_BITS_PER_BUCKET, (round + 1) * NUM_BITS_PER_BUCKET)], 1);
+      }
+    }
   }
 
-  workgroupBarrier();
-
-  let end = min(
-    numItems, 
-    tileStart + itemsPerThreadPerTile * blockSize
-  );
-
-  for (var i: u32 = tileStart; i < end; i += blockSize) {
-    let key = gaussians[i].sortKey;
-    
-
-
+  if (localIndex == 0) {
+    for (var round: u32 = 0; round < NUM_PASSES; round++) {
+      for (var bucket: u32 = 0; bucket < NUM_BUCKETS; bucket++) {
+        atomicAdd(
+          &globalHistogram[round][bucket], 
+          atomicLoad(&localHistogram[round][bucket])
+        );
+      }
+    }
   }
-
 }
   `,
       }),
@@ -225,6 +244,10 @@ fn computeBinSizes(
   const binPackingInputBuffer = device.createBuffer({
     size: NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+  });
+  const binSizingSliceBuffer = device.createBuffer({
+    size: 2 * NUM_BYTES_UINT32,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
   });
 
   const guassianPipeline = device.createComputePipeline({
@@ -406,8 +429,9 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           layout: binSizingPipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffer } },
-            { binding: 1, resource: { buffer: histogramBuffer } },
-            { binding: 2, resource: { buffer: binPackingInputBuffer } },
+            { binding: 1, resource: { buffer: binSizingSliceBuffer } },
+            { binding: 2, resource: { buffer: histogramBuffer } },
+            { binding: 3, resource: { buffer: binPackingInputBuffer } },
           ],
         }),
       ];
@@ -423,13 +447,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       ];
     }
 
-    device.queue.writeBuffer(
-      cameraBuffer,
-      0,
-      cameraMatrix.buffer,
-      cameraMatrix.byteOffset,
-      cameraMatrix.byteLength
-    );
+    writeToBuffer(device.queue, cameraBuffer, cameraMatrix);
 
     const projectionPass = encoder.beginComputePass();
     projectionPass.setPipeline(projectGaussiansPipeline);
@@ -442,6 +460,12 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     // reset the histogram
     encoder.clearBuffer(histogramBuffer);
     encoder.clearBuffer(binPackingInputBuffer);
+
+    writeToBuffer(
+      device.queue,
+      binSizingSliceBuffer,
+      new Uint32Array([0, numSplats])
+    );
 
     const binSizingPass = encoder.beginComputePass();
     binSizingPass.setPipeline(binSizingPipeline);
