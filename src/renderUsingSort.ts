@@ -294,13 +294,54 @@ fn exclusivePrefixSum(
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.STORAGE,
   });
-  const binPackingInputBuffer = device.createBuffer({
+  const nextTileIndexBuffer = device.createBuffer({
     size: NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
   });
   const dataSliceBuffer = device.createBuffer({
     size: 2 * NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
+  });
+
+  const sortPipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      entryPoint: "sortProjections",
+      module: device.createShaderModule({
+        label: "Sort Gaussian Projections",
+        code: `
+${PROJECTED_GUASSIAN_DEF}
+${SLICE_DEF}  
+
+const NUM_PASSES = 4;
+const NUM_BUCKETS = 256;
+
+@group(0) @binding(0) var<storage, read> input: array<ProjectedGaussian>;
+@group(0) @binding(1) var<storage, read_write> output: array<ProjectedGaussian>;
+@group(1) @binding(0) var<uniform> slice: Slice;
+@group(1) @binding(1) var<storage, read> globalHistogram: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
+@group(1) @binding(2) var<storage, read_write> nextTileStart: atomic<u32>;
+
+const passIndex = 0;
+
+override blockSize: u32 = 32;
+override itemsPerThreadPerTile: u32 = 16;
+
+@compute @workgroup_size(blockSize)
+fn sortProjections() {
+  let tileSize = itemsPerThreadPerTile * blockSize;
+  _ = atomicLoad(&nextTileStart);
+
+  _ = input[0];
+  _ = output[0];
+  _ = globalHistogram[0][0];
+  _ = slice.offset;
+  _ = passIndex;
+}
+
+  `,
+      }),
+    },
   });
 
   const guassianPipeline = device.createComputePipeline({
@@ -373,9 +414,10 @@ fn renderGaussians(
   });
 
   let projectedGaussianBufferSize = 0;
-  let projectedGaussianBuffer: undefined | GPUBuffer;
+  let projectedGaussianBuffers: undefined | Array<GPUBuffer>;
   let projectedDataBindGroups: undefined | Array<GPUBindGroup>;
   let binSizingDataBindGroups: undefined | Array<GPUBindGroup>;
+  let sortPassDataBindGroups: undefined | Array<GPUBindGroup>;
   let renderDataBindGroups: undefined | Array<GPUBindGroup>;
 
   // creates a shader that needs to draw 4 points, one for each corner of the screen
@@ -475,15 +517,17 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     const encoder = device.createCommandEncoder();
 
     if (numSplats !== projectedGaussianBufferSize) {
-      if (projectedGaussianBuffer) {
-        projectedGaussianBuffer.destroy();
-      }
-
-      projectedGaussianBuffer = device.createBuffer({
-        label: `Projected Gaussians (${numSplats})`,
-        size: numSplats * 12 * NUM_BYTES_FLOAT32,
-        usage: GPUBufferUsage.STORAGE,
+      projectedGaussianBuffers?.forEach((buffer) => {
+        buffer.destroy();
       });
+
+      projectedGaussianBuffers = ["", " (scratch-space)"].map((name) =>
+        device.createBuffer({
+          label: `Projected Gaussians Buffer${name} (size ${numSplats})`,
+          size: numSplats * 12 * NUM_BYTES_FLOAT32,
+          usage: GPUBufferUsage.STORAGE,
+        })
+      );
 
       projectedDataBindGroups = [
         device.createBindGroup({
@@ -492,7 +536,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           entries: [
             { binding: 0, resource: { buffer: splatData } },
             { binding: 1, resource: { buffer: cameraBuffer } },
-            { binding: 2, resource: { buffer: projectedGaussianBuffer } },
+            { binding: 2, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 3, resource: { buffer: dataSliceBuffer } },
           ],
         }),
@@ -503,10 +547,28 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           label: "Bin Sizing Data",
           layout: binSizingPipeline.getBindGroupLayout(0),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffer } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
             { binding: 2, resource: { buffer: histogramBuffer } },
-            { binding: 3, resource: { buffer: binPackingInputBuffer } },
+            { binding: 3, resource: { buffer: nextTileIndexBuffer } },
+          ],
+        }),
+      ];
+
+      sortPassDataBindGroups = [
+        device.createBindGroup({
+          layout: sortPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
+            { binding: 1, resource: { buffer: projectedGaussianBuffers[1] } },
+          ],
+        }),
+        device.createBindGroup({
+          layout: sortPipeline.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: { buffer: dataSliceBuffer } },
+            { binding: 1, resource: { buffer: histogramBuffer } },
+            { binding: 2, resource: { buffer: nextTileIndexBuffer } },
           ],
         }),
       ];
@@ -516,7 +578,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBindGroup({
           layout: guassianPipeline.getBindGroupLayout(1),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffer } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
           ],
         }),
@@ -535,7 +597,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
     // reset the histogram
     encoder.clearBuffer(histogramBuffer);
-    encoder.clearBuffer(binPackingInputBuffer);
+    encoder.clearBuffer(nextTileIndexBuffer);
 
     writeToBuffer(
       device.queue,
@@ -552,11 +614,21 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     binSizingPass.dispatchWorkgroups(64);
     binSizingPass.end();
 
+    encoder.clearBuffer(nextTileIndexBuffer);
+
     const prefixSumPass = encoder.beginComputePass();
     prefixSumPass.setPipeline(prefixSumPipeline);
     prefixSumPass.setBindGroup(0, prefixSumBindGroup);
     prefixSumPass.dispatchWorkgroups(4);
     prefixSumPass.end();
+
+    const sortPass0 = encoder.beginComputePass();
+    sortPass0.setPipeline(sortPipeline);
+    sortPassDataBindGroups!.forEach((group, i) => {
+      sortPass0.setBindGroup(i, group);
+    });
+    sortPass0.dispatchWorkgroups(2);
+    sortPass0.end();
 
     const guassianPass = encoder.beginComputePass();
     guassianPass.setPipeline(guassianPipeline);
