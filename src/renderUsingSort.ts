@@ -246,6 +246,44 @@ fn computeBinSizes(
     },
   });
 
+  const prefixSumPipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      entryPoint: "exclusivePrefixSum",
+      module: device.createShaderModule({
+        label: "Radix Sort Histogram Computation",
+        code: `
+const NUM_PASSES = 4;
+const NUM_BUCKETS = 256;
+
+@group(0) @binding(0) var<storage, read_write> globalHistogram: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
+
+var<workgroup> scratchSpace: array<u32, NUM_BUCKETS>;
+
+@compute @workgroup_size(NUM_BUCKETS)
+fn exclusivePrefixSum(
+  @builtin(local_invocation_index) index: u32,
+  @builtin(workgroup_id) group: vec3u,
+) {
+  let original = globalHistogram[group.x][index];
+  var sum = original;
+  for (var i: u32 = 1; i < NUM_BUCKETS; i *= 2) {
+    scratchSpace[index] = sum;
+
+    workgroupBarrier();
+
+    if (index >= i) {
+      sum += scratchSpace[index - i];
+    }
+  }
+
+  globalHistogram[group.x][index] = sum - original;
+}
+        `,
+      }),
+    },
+  });
+
   const histogramBuffer = device.createBuffer({
     size:
       4 /* number of passes */ *
@@ -380,11 +418,11 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   var tint = vec4f(0, 0, 0, 1);
 
   if (fragUV.x < dim) {
-    tint.x = f32(debug_histogram[1][u32(fragUV.y / dim)]) / 100.;
+    tint.x = f32(debug_histogram[1][u32(fragUV.y / dim)]) / 1000.;
   }
 
   if (fragUV.y < dim) {
-    tint.y = f32(debug_histogram[0][u32(fragUV.x / dim)]) / 100.;
+    tint.y = f32(debug_histogram[0][u32(fragUV.x / dim)]) / 1000.;
   }
 
   let color = textureSample(screenTexture, screenSampler, fragUV);
@@ -412,6 +450,11 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     primitive: {
       topology: "triangle-strip",
     },
+  });
+
+  const prefixSumBindGroup = device.createBindGroup({
+    layout: prefixSumPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: histogramBuffer } }],
   });
 
   const renderTextureBindGroup = device.createBindGroup({
@@ -508,6 +551,12 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     // the number should be proportional to the number of gpu cores
     binSizingPass.dispatchWorkgroups(64);
     binSizingPass.end();
+
+    const prefixSumPass = encoder.beginComputePass();
+    prefixSumPass.setPipeline(prefixSumPipeline);
+    prefixSumPass.setBindGroup(0, prefixSumBindGroup);
+    prefixSumPass.dispatchWorkgroups(4);
+    prefixSumPass.end();
 
     const guassianPass = encoder.beginComputePass();
     guassianPass.setPipeline(guassianPipeline);
