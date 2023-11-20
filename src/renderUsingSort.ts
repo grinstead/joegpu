@@ -313,8 +313,9 @@ fn exclusivePrefixSum(
 ${PROJECTED_GUASSIAN_DEF}
 ${SLICE_DEF}  
 
-const NUM_PASSES = 4;
-const NUM_BUCKETS = 256;
+const NUM_BITS_PER_BUCKET: u32 = 8;
+const NUM_PASSES: u32 = 32 / NUM_BITS_PER_BUCKET;
+const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 @group(0) @binding(0) var<storage, read> input: array<ProjectedGaussian>;
 @group(0) @binding(1) var<storage, read_write> output: array<ProjectedGaussian>;
@@ -327,10 +328,73 @@ const passIndex = 0;
 override blockSize: u32 = 32;
 override itemsPerThreadPerTile: u32 = 16;
 
+var<workgroup> tileStart: u32;
+var<workgroup> localHistogram: array<atomic<u32>, NUM_BUCKETS>;
+var<workgroup> scratchpad: array<u32, blockSize * itemsPerThreadPerTile>;
+
 @compute @workgroup_size(blockSize)
-fn sortProjections() {
-  let tileSize = itemsPerThreadPerTile * blockSize;
-  _ = atomicLoad(&nextTileStart);
+fn sortProjections(
+  @builtin(local_invocation_index) localIndex: u32,
+) {
+  let targetTileSize = itemsPerThreadPerTile * blockSize;
+
+  if (localIndex == 0) {
+    tileStart = atomicAdd(&nextTileStart, targetTileSize);
+  }
+
+  let tileLength: u32 = min(
+    targetTileSize,
+    slice.length - workgroupUniformLoad(&tileStart)
+  );
+
+  for (var i = localIndex; i < tileLength; i += blockSize) {
+    // first step is to write the key-index pair into the scratchpad, unsorted
+    scratchpad[i] = insertBits(
+      // index
+      i,
+      // the actual key we are sorting on
+      input[slice.offset + tileStart + i].sortKey >> (passIndex * NUM_BITS_PER_BUCKET),
+      // put the key on the most significant bits
+      32 - NUM_BITS_PER_BUCKET,
+      NUM_BITS_PER_BUCKET,
+    );
+  }
+
+  workgroupBarrier();
+
+  // copied from wikipedia pseudo-code
+  // https://en.wikipedia.org/wiki/Bitonic_sorter
+  for (var k: u32 = 2; k <= tileLength; k *= 2) {
+    for (var j: u32 = k/2; j > 0; j /= 2) {
+      for (var i = localIndex; i < tileLength; i += blockSize) {
+        let neighbor = i ^ j;
+        if (neighbor > i) {
+          let mine = scratchpad[i];
+          let theirs = scratchpad[neighbor];
+
+          if (select((mine < theirs), (mine > theirs), (i & k) == 0)) {
+            scratchpad[i] = theirs;
+            scratchpad[neighbor] = mine;
+          }
+        }
+      }
+
+      workgroupBarrier();
+    }
+  }
+
+  for (var i = localIndex; i < tileLength; i += blockSize) {
+    output[slice.offset + tileStart + i] =
+      input[
+        slice.offset +
+        tileStart +
+        extractBits(
+          scratchpad[i],
+          0,
+          32 - NUM_BITS_PER_BUCKET
+        )
+      ];
+  }
 
   _ = input[0];
   _ = output[0];
@@ -578,7 +642,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBindGroup({
           layout: guassianPipeline.getBindGroupLayout(1),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[1] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
           ],
         }),
@@ -627,7 +691,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     sortPassDataBindGroups!.forEach((group, i) => {
       sortPass0.setBindGroup(i, group);
     });
-    sortPass0.dispatchWorkgroups(2);
+    sortPass0.dispatchWorkgroups(Math.ceil(numSplats / 512));
     sortPass0.end();
 
     const guassianPass = encoder.beginComputePass();
