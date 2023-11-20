@@ -348,16 +348,16 @@ fn sortProjections(
   );
 
   for (var i = localIndex; i < tileLength; i += blockSize) {
-    // first step is to write the key-index pair into the scratchpad, unsorted
-    scratchpad[i] = insertBits(
-      // index
-      i,
-      // the actual key we are sorting on
-      input[slice.offset + tileStart + i].sortKey >> (passIndex * NUM_BITS_PER_BUCKET),
-      // put the key on the most significant bits
-      32 - NUM_BITS_PER_BUCKET,
-      NUM_BITS_PER_BUCKET,
+    let key = extractBits(
+      input[slice.offset + tileStart + i].sortKey,
+      passIndex * NUM_BITS_PER_BUCKET, 
+      NUM_BITS_PER_BUCKET
     );
+
+    atomicAdd(&localHistogram[key], 1);
+
+    // combine the key with the index, we'll sort that combined value
+    scratchpad[i] = insertBits(i, key, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
   }
 
   workgroupBarrier();
@@ -396,11 +396,7 @@ fn sortProjections(
       ];
   }
 
-  _ = input[0];
-  _ = output[0];
   _ = globalHistogram[0][0];
-  _ = slice.offset;
-  _ = passIndex;
 }
 
   `,
