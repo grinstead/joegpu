@@ -325,11 +325,12 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 const passIndex = 0;
 
-override blockSize: u32 = 32;
+const blockSize: u32 = 32;
 override itemsPerThreadPerTile: u32 = 16;
 
 var<workgroup> tileStart: u32;
 var<workgroup> localHistogram: array<atomic<u32>, NUM_BUCKETS>;
+var<workgroup> prefixSum: array<u32, NUM_BUCKETS>;
 var<workgroup> scratchpad: array<u32, blockSize * itemsPerThreadPerTile>;
 
 @compute @workgroup_size(blockSize)
@@ -360,7 +361,34 @@ fn sortProjections(
     scratchpad[i] = insertBits(i, key, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
   }
 
-  workgroupBarrier();
+  // as long as this assert is true, we know that j + localIndex will not overflow
+  const_assert (NUM_BUCKETS % blockSize == 0);
+
+  // write the initial values in
+  for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
+    prefixSum[index] = atomicLoad(&localHistogram[index]);
+  }
+
+  // add all the values together as necessary
+  for (var i: u32 = 1; i < NUM_BUCKETS; i *= 2) {
+    for (var j: u32 = 0; j < NUM_BUCKETS; j += blockSize) {
+      let index = j + localIndex;
+
+      var earlierSum: u32 = 0;
+      if (i <= index) {
+        earlierSum = prefixSum[index - i];
+      }
+      workgroupBarrier();
+
+      prefixSum[index] += earlierSum;
+      workgroupBarrier();
+    }
+  }
+
+  // subtract out the local bucket size
+  for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
+    prefixSum[index] -= atomicLoad(&localHistogram[index]);
+  }
 
   // copied from wikipedia pseudo-code
   // https://en.wikipedia.org/wiki/Bitonic_sorter
