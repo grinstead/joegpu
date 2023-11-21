@@ -4,6 +4,9 @@ import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
 
+const SORT_TILE_SIZE = 512;
+const NUM_BUCKETS = 256;
+
 const SLICE_DEF = `
 struct Slice {
   offset: u32,
@@ -319,17 +322,22 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 @group(0) @binding(0) var<storage, read> input: array<ProjectedGaussian>;
 @group(0) @binding(1) var<storage, read_write> output: array<ProjectedGaussian>;
+@group(0) @binding(2) var<storage, read_write> localHistograms: array<array<atomic<u32>, NUM_BUCKETS>>;
 @group(1) @binding(0) var<uniform> slice: Slice;
 @group(1) @binding(1) var<storage, read> globalHistogram: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
-@group(1) @binding(2) var<storage, read_write> nextTileStart: atomic<u32>;
+@group(1) @binding(2) var<storage, read_write> nextTileIndex: atomic<u32>;
 
 const passIndex = 0;
 
 const blockSize: u32 = 32;
-override itemsPerThreadPerTile: u32 = 16;
+const itemsPerThreadPerTile: u32 = 16;
+const targetTileSize = itemsPerThreadPerTile * blockSize;
 
-var<workgroup> tileStart: u32;
-var<workgroup> localHistogram: array<atomic<u32>, NUM_BUCKETS>;
+const LOCAL_RESOLVED_FLAG: u32 = 1 << 30;
+const GLOBAL_RESOLVED_FLAG: u32 = 1 << 31;
+const VALUE_MASK: u32 = ~(LOCAL_RESOLVED_FLAG | GLOBAL_RESOLVED_FLAG);
+
+var<workgroup> tileIndex: u32;
 var<workgroup> prefixSum: array<u32, NUM_BUCKETS>;
 var<workgroup> scratchpad: array<u32, blockSize * itemsPerThreadPerTile>;
 
@@ -337,16 +345,12 @@ var<workgroup> scratchpad: array<u32, blockSize * itemsPerThreadPerTile>;
 fn sortProjections(
   @builtin(local_invocation_index) localIndex: u32,
 ) {
-  let targetTileSize = itemsPerThreadPerTile * blockSize;
-
   if (localIndex == 0) {
-    tileStart = atomicAdd(&nextTileStart, targetTileSize);
+    tileIndex = atomicAdd(&nextTileIndex, 1);
   }
 
-  let tileLength: u32 = min(
-    targetTileSize,
-    slice.length - workgroupUniformLoad(&tileStart)
-  );
+  let tileStart = workgroupUniformLoad(&tileIndex) * targetTileSize;
+  let tileLength: u32 = min(targetTileSize, slice.length - tileStart);
 
   for (var i = localIndex; i < tileLength; i += blockSize) {
     let key = extractBits(
@@ -355,7 +359,7 @@ fn sortProjections(
       NUM_BITS_PER_BUCKET
     );
 
-    atomicAdd(&localHistogram[key], 1);
+    atomicAdd(&localHistograms[tileIndex][key], 1);
 
     // combine the key with the index, we'll sort that combined value
     scratchpad[i] = insertBits(i, key, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
@@ -366,7 +370,7 @@ fn sortProjections(
 
   // write the initial values in
   for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
-    prefixSum[index] = atomicLoad(&localHistogram[index]);
+    prefixSum[index] = atomicLoad(&localHistograms[tileIndex][index]);
   }
 
   // add all the values together as necessary
@@ -387,8 +391,50 @@ fn sortProjections(
 
   // subtract out the local bucket size
   for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
-    prefixSum[index] -= atomicLoad(&localHistogram[index]);
+    var exclusiveSum = prefixSum[index] - atomicLoad(&localHistograms[tileIndex][index]);
+
+    if (tileIndex == 0) {
+      exclusiveSum += globalHistogram[passIndex][index];
+    }
+
+    prefixSum[index] = exclusiveSum;
+
+    atomicStore(
+      &localHistograms[tileIndex][index],
+      exclusiveSum + select(LOCAL_RESOLVED_FLAG, GLOBAL_RESOLVED_FLAG, tileIndex == 0)
+    );
   }
+
+  // write to the global histogram
+  if (tileIndex > 0) {
+    for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
+      var sum = prefixSum[index];
+
+      var prevTile: u32 = tileIndex - 1;      
+      loop {
+        let prevValue = atomicLoad(&localHistograms[prevTile][index]);
+
+        if ((prevValue & GLOBAL_RESOLVED_FLAG) != 0) {
+          // it comes with the flag bit, sort of convenient
+          sum += prevValue;
+          atomicStore(&localHistograms[tileIndex][index], sum);
+          break;
+        } else if ((prevValue & LOCAL_RESOLVED_FLAG) != 0) {
+          sum += (prevValue & VALUE_MASK);
+
+          // we know that prevTile is > 0 because the 0th tile will never write the LOCAL_RESOLVED_FLAG,
+          // it will only ever write the GLOBAL_RESOLVED_FLAG or no flag at all
+          prevTile--;
+        } else {
+          // loop back on this tile
+        }
+      }
+
+      prefixSum[index] = sum;
+    }
+  }
+
+  workgroupBarrier();
 
   // copied from wikipedia pseudo-code
   // https://en.wikipedia.org/wiki/Bitonic_sorter
@@ -412,19 +458,18 @@ fn sortProjections(
   }
 
   for (var i = localIndex; i < tileLength; i += blockSize) {
+    let keyAndIndex = scratchpad[i];
+    let key = extractBits(keyAndIndex, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
+    let index = extractBits(keyAndIndex, 0, 32 - NUM_BITS_PER_BUCKET);
+
     output[slice.offset + tileStart + i] =
       input[
         slice.offset +
         tileStart +
-        extractBits(
-          scratchpad[i],
-          0,
-          32 - NUM_BITS_PER_BUCKET
-        )
+        (atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK) +
+        (index - prefixSum[key])
       ];
   }
-
-  _ = globalHistogram[0][0];
 }
 
   `,
@@ -505,6 +550,7 @@ fn renderGaussians(
   let projectedGaussianBuffers: undefined | Array<GPUBuffer>;
   let projectedDataBindGroups: undefined | Array<GPUBindGroup>;
   let binSizingDataBindGroups: undefined | Array<GPUBindGroup>;
+  let histogramsBuffer: undefined | GPUBuffer;
   let sortPassDataBindGroups: undefined | Array<GPUBindGroup>;
   let renderDataBindGroups: undefined | Array<GPUBindGroup>;
 
@@ -608,6 +654,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       projectedGaussianBuffers?.forEach((buffer) => {
         buffer.destroy();
       });
+      histogramsBuffer?.destroy();
 
       projectedGaussianBuffers = ["", " (scratch-space)"].map((name) =>
         device.createBuffer({
@@ -630,6 +677,15 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         }),
       ];
 
+      histogramsBuffer = device.createBuffer({
+        label: `Local Histograms used in Sorting`,
+        size:
+          Math.ceil(numSplats / SORT_TILE_SIZE) *
+          NUM_BUCKETS *
+          NUM_BYTES_UINT32,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+
       binSizingDataBindGroups = [
         device.createBindGroup({
           label: "Bin Sizing Data",
@@ -649,6 +705,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: projectedGaussianBuffers[1] } },
+            { binding: 2, resource: { buffer: histogramsBuffer } },
           ],
         }),
         device.createBindGroup({
@@ -703,6 +760,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     binSizingPass.end();
 
     encoder.clearBuffer(nextTileIndexBuffer);
+    encoder.clearBuffer(histogramsBuffer!);
 
     const prefixSumPass = encoder.beginComputePass();
     prefixSumPass.setPipeline(prefixSumPipeline);
@@ -715,7 +773,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     sortPassDataBindGroups!.forEach((group, i) => {
       sortPass0.setBindGroup(i, group);
     });
-    sortPass0.dispatchWorkgroups(Math.ceil(numSplats / 512));
+    sortPass0.dispatchWorkgroups(Math.ceil(numSplats / SORT_TILE_SIZE));
     sortPass0.end();
 
     const guassianPass = encoder.beginComputePass();
