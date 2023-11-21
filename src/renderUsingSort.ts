@@ -154,13 +154,12 @@ fn projectGaussians(
 
   projectedGaussians[index.x] = ProjectedGaussian(
     screenSpace,
-    1024 - max(1024, u32(screenSpace.z * 1000)),
-    // insertBits(
-    //   vec2f(0, pack2x16float(screenSpace.z)),
-    //   min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
-    //   16,
-    //   16
-    // ),
+    insertBits(
+      u32(clamp(screenSpace.z, 0, (1 << 3) - .0001) * (1 << 13)),
+      0, //min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
+      16,
+      16,
+    ),
     // min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
@@ -508,7 +507,7 @@ fn renderGaussians(
   @builtin(global_invocation_id) pixel: vec3u,
 ) {
   let coords = 2 * vec2f(pixel.xy) / vec2f(textureDimensions(outputTexture)) - 1;
-  var color = vec4f(.1, .1, .1, 0);
+  var color = vec4f(0, 0, 0, 0);
 
   let end = slice.offset + slice.length;
   for (var i = slice.offset; i < end; i++) {
@@ -531,10 +530,9 @@ fn renderGaussians(
       continue;
     }
 
-    let alpha = min(.99, exp(power) * in.color.w);
+    let alpha = min(.99, exp(power) * in.color.w) * (1 - color.w);
 
-    color = (1 - alpha) * color + alpha * in.color;
-    // color = vec4f(0, alpha, 0, 1);
+    color += vec4f(alpha * in.color.xyz, alpha);
   }
 
   textureStore(outputTexture, pixel.xy, color);
@@ -602,11 +600,15 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   var tint = vec4f(0, 0, 0, 1);
 
   if (fragUV.x < dim) {
-    tint.x = f32(debug_histogram[1][u32(fragUV.y / dim)]) / 1000.;
+    tint.x = f32(debug_histogram[3][u32(fragUV.y / dim)]) / 1000.;
+  } else if (fragUV.x >= 1 - dim) {
+    tint.x = f32(debug_histogram[1][u32(256 * fragUV.y)]) / 1000.;
   }
 
   if (fragUV.y < dim) {
-    tint.y = f32(debug_histogram[0][u32(fragUV.x / dim)]) / 1000.;
+    tint.y = f32(debug_histogram[2][u32(fragUV.x / dim)]) / 1000.;
+  } else if (fragUV.y >= 1 - dim) {
+    tint.y = f32(debug_histogram[0][u32(256 * fragUV.x)]) / 1000.;
   }
 
   let color = textureSample(screenTexture, screenSampler, fragUV);
