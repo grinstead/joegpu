@@ -7,6 +7,8 @@ const CHUNK_SIZE = 16;
 const SORT_TILE_SIZE = 512;
 const NUM_BUCKETS = 256;
 
+const HISTOGRAM_SIZE = NUM_BUCKETS * NUM_BYTES_UINT32;
+
 const SLICE_DEF = `
 struct Slice {
   offset: u32,
@@ -288,10 +290,7 @@ fn exclusivePrefixSum(
   });
 
   const histogramBuffer = device.createBuffer({
-    size:
-      4 /* number of passes */ *
-      256 /* number of buckets per pass */ *
-      NUM_BYTES_UINT32,
+    size: 4 /* number of passes */ * NUM_BUCKETS * NUM_BYTES_UINT32,
     usage:
       GPUBufferUsage.COPY_DST |
       GPUBufferUsage.COPY_SRC |
@@ -324,10 +323,8 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 @group(0) @binding(1) var<storage, read_write> output: array<ProjectedGaussian>;
 @group(0) @binding(2) var<storage, read_write> localHistograms: array<array<atomic<u32>, NUM_BUCKETS>>;
 @group(1) @binding(0) var<uniform> slice: Slice;
-@group(1) @binding(1) var<storage, read> globalHistogram: array<array<u32, NUM_BUCKETS>, NUM_PASSES>;
+@group(1) @binding(1) var<storage, read> globalHistogram: array<u32, NUM_BUCKETS>;
 @group(1) @binding(2) var<storage, read_write> nextTileIndex: atomic<u32>;
-
-const passIndex = 0;
 
 const blockSize: u32 = 32;
 const itemsPerThreadPerTile: u32 = 16;
@@ -355,7 +352,7 @@ fn sortProjections(
   for (var i = localIndex; i < tileLength; i += blockSize) {
     let key = extractBits(
       input[slice.offset + tileStart + i].sortKey,
-      passIndex * NUM_BITS_PER_BUCKET, 
+      0, 
       NUM_BITS_PER_BUCKET
     );
 
@@ -394,7 +391,7 @@ fn sortProjections(
     var exclusiveSum = prefixSum[index] - atomicLoad(&localHistograms[tileIndex][index]);
 
     if (tileIndex == 0) {
-      exclusiveSum += globalHistogram[passIndex][index];
+      exclusiveSum += globalHistogram[index];
     }
 
     prefixSum[index] = exclusiveSum;
@@ -462,13 +459,17 @@ fn sortProjections(
     let key = extractBits(keyAndIndex, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
     let index = extractBits(keyAndIndex, 0, 32 - NUM_BITS_PER_BUCKET);
 
-    output[slice.offset + tileStart + i] =
-      input[
-        slice.offset +
-        tileStart +
-        (atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK) +
-        (index - prefixSum[key])
-      ];
+    var gaussian = input[
+      slice.offset +
+      tileStart +
+      (atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK) +
+      (index - prefixSum[key])
+    ];
+
+    // drop this pass from the key
+    gaussian.sortKey = gaussian.sortKey >> 8;
+
+    output[slice.offset + tileStart + i] = gaussian;
   }
 }
 
@@ -712,7 +713,14 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           layout: sortPipeline.getBindGroupLayout(1),
           entries: [
             { binding: 0, resource: { buffer: dataSliceBuffer } },
-            { binding: 1, resource: { buffer: histogramBuffer } },
+            {
+              binding: 1,
+              resource: {
+                buffer: histogramBuffer,
+                offset: 0,
+                size: HISTOGRAM_SIZE,
+              },
+            },
             { binding: 2, resource: { buffer: nextTileIndexBuffer } },
           ],
         }),
