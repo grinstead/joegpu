@@ -9,7 +9,7 @@ const NUM_BUCKETS = 256;
 
 const HISTOGRAM_SIZE = NUM_BUCKETS * NUM_BYTES_UINT32;
 
-const SLICE_DEF = `
+const COMMON_DEFS = `
 struct Slice {
   offset: u32,
   length: u32,
@@ -33,6 +33,19 @@ export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
     x: Math.ceil(canvas.width / CHUNK_SIZE),
     y: Math.ceil(canvas.height / CHUNK_SIZE),
   };
+
+  const constants = [0, 1, 2, 3];
+  const constantsBuffers = constants.map((c) => {
+    const buffer = device.createBuffer({
+      label: `Single Constant (value = ${c})`,
+      size: NUM_BYTES_UINT32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    writeToBuffer(device.queue, buffer, new Uint32Array([c]));
+
+    return buffer;
+  });
 
   const outputTexture = device.createTexture({
     label: "Splat Output Texture",
@@ -62,7 +75,7 @@ struct GaussianSplat {
 }
 
 ${PROJECTED_GUASSIAN_DEF}
-${SLICE_DEF}
+${COMMON_DEFS}
 
 const HARMONIC_COEFF0: f32 = 0.28209479177387814;
 
@@ -181,7 +194,7 @@ fn projectGaussians(
         label: "Radix Sort Histogram Computation",
         code: `
 ${PROJECTED_GUASSIAN_DEF}
-${SLICE_DEF}
+${COMMON_DEFS}
 
 const NUM_BITS_PER_BUCKET: u32 = 8;
 const NUM_PASSES: u32 = 32 / NUM_BITS_PER_BUCKET;
@@ -319,7 +332,7 @@ fn exclusivePrefixSum(
         label: "Sort Gaussian Projections",
         code: `
 ${PROJECTED_GUASSIAN_DEF}
-${SLICE_DEF}  
+${COMMON_DEFS}  
 
 const NUM_BITS_PER_BUCKET: u32 = 8;
 const NUM_PASSES: u32 = 32 / NUM_BITS_PER_BUCKET;
@@ -331,6 +344,7 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 @group(1) @binding(0) var<uniform> slice: Slice;
 @group(1) @binding(1) var<storage, read> globalHistogram: array<u32, NUM_BUCKETS>;
 @group(1) @binding(2) var<storage, read_write> nextTileIndex: atomic<u32>;
+@group(1) @binding(3) var<uniform> passIndex: u32;
 
 const blockSize: u32 = 32;
 const itemsPerThreadPerTile: u32 = 16;
@@ -358,7 +372,7 @@ fn sortProjections(
   for (var i = localIndex; i < tileLength; i += blockSize) {
     let key = extractBits(
       input[slice.offset + tileStart + i].sortKey,
-      0, 
+      passIndex * NUM_BITS_PER_BUCKET, 
       NUM_BITS_PER_BUCKET
     );
 
@@ -465,17 +479,12 @@ fn sortProjections(
     let key = extractBits(keyAndIndex, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
     let index = extractBits(keyAndIndex, 0, 32 - NUM_BITS_PER_BUCKET);
 
-    var gaussian = input[
+    output[slice.offset + tileStart + i] = input[
       slice.offset +
       tileStart +
       (atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK) +
       (index - prefixSum[key])
     ];
-
-    // drop this pass from the key
-    gaussian.sortKey = gaussian.sortKey >> 8;
-
-    output[slice.offset + tileStart + i] = gaussian;
   }
 }
 
@@ -492,7 +501,7 @@ fn sortProjections(
         label: "Gaussian Splatting Shader",
         code: `
 ${PROJECTED_GUASSIAN_DEF}
-${SLICE_DEF}
+${COMMON_DEFS}
 
 @group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(0) var<storage> renderables: array<ProjectedGaussian>;
@@ -737,6 +746,12 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
               },
             },
             { binding: 2, resource: { buffer: nextTileIndexBuffer } },
+            {
+              binding: 3,
+              resource: {
+                buffer: constantsBuffers[constants.indexOf(i)],
+              },
+            },
           ],
         }),
       ]);
