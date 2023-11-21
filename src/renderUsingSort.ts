@@ -154,7 +154,14 @@ fn projectGaussians(
 
   projectedGaussians[index.x] = ProjectedGaussian(
     screenSpace,
-    min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
+    1024 - max(1024, u32(screenSpace.z * 1000)),
+    // insertBits(
+    //   vec2f(0, pack2x16float(screenSpace.z)),
+    //   min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
+    //   16,
+    //   16
+    // ),
+    // min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -407,7 +414,7 @@ fn sortProjections(
     for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
       var sum = prefixSum[index];
 
-      var prevTile: u32 = tileIndex - 1;      
+      var prevTile: u32 = tileIndex - 1;
       loop {
         let prevValue = atomicLoad(&localHistograms[prevTile][index]);
 
@@ -552,7 +559,7 @@ fn renderGaussians(
   let projectedDataBindGroups: undefined | Array<GPUBindGroup>;
   let binSizingDataBindGroups: undefined | Array<GPUBindGroup>;
   let histogramsBuffer: undefined | GPUBuffer;
-  let sortPassDataBindGroups: undefined | Array<GPUBindGroup>;
+  let sortPassDataBindGroups: undefined | Array<Array<GPUBindGroup>>;
   let renderDataBindGroups: undefined | Array<GPUBindGroup>;
 
   // creates a shader that needs to draw 4 points, one for each corner of the screen
@@ -700,13 +707,19 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         }),
       ];
 
-      sortPassDataBindGroups = [
+      sortPassDataBindGroups = [0, 1, 0, 1].map((oddRound, i) => [
         device.createBindGroup({
           layout: sortPipeline.getBindGroupLayout(0),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
-            { binding: 1, resource: { buffer: projectedGaussianBuffers[1] } },
-            { binding: 2, resource: { buffer: histogramsBuffer } },
+            {
+              binding: 0,
+              resource: { buffer: projectedGaussianBuffers![oddRound] },
+            },
+            {
+              binding: 1,
+              resource: { buffer: projectedGaussianBuffers![1 - oddRound] },
+            },
+            { binding: 2, resource: { buffer: histogramsBuffer! } },
           ],
         }),
         device.createBindGroup({
@@ -717,14 +730,14 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
               binding: 1,
               resource: {
                 buffer: histogramBuffer,
-                offset: 0,
+                offset: i * HISTOGRAM_SIZE,
                 size: HISTOGRAM_SIZE,
               },
             },
             { binding: 2, resource: { buffer: nextTileIndexBuffer } },
           ],
         }),
-      ];
+      ]);
 
       renderDataBindGroups = [
         guassianBindGroup,
@@ -768,7 +781,6 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     binSizingPass.end();
 
     encoder.clearBuffer(nextTileIndexBuffer);
-    encoder.clearBuffer(histogramsBuffer!);
 
     const prefixSumPass = encoder.beginComputePass();
     prefixSumPass.setPipeline(prefixSumPipeline);
@@ -776,13 +788,18 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     prefixSumPass.dispatchWorkgroups(4);
     prefixSumPass.end();
 
-    const sortPass0 = encoder.beginComputePass();
-    sortPass0.setPipeline(sortPipeline);
-    sortPassDataBindGroups!.forEach((group, i) => {
-      sortPass0.setBindGroup(i, group);
+    sortPassDataBindGroups!.forEach((groups, i) => {
+      encoder.clearBuffer(nextTileIndexBuffer);
+      encoder.clearBuffer(histogramsBuffer!);
+
+      const sortPass = encoder.beginComputePass();
+      sortPass.setPipeline(sortPipeline);
+      groups.forEach((group, i) => {
+        sortPass.setBindGroup(i, group);
+      });
+      sortPass.dispatchWorkgroups(Math.ceil(numSplats / SORT_TILE_SIZE));
+      sortPass.end();
     });
-    sortPass0.dispatchWorkgroups(Math.ceil(numSplats / SORT_TILE_SIZE));
-    sortPass0.end();
 
     const guassianPass = encoder.beginComputePass();
     guassianPass.setPipeline(guassianPipeline);
