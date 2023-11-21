@@ -156,7 +156,7 @@ fn projectGaussians(
     screenSpace,
     insertBits(
       u32(clamp(screenSpace.z, 0, (1 << 3) - .0001) * (1 << 13)),
-      0, //min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
+      min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
       16,
       16,
     ),
