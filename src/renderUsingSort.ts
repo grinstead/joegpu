@@ -711,7 +711,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
   let rangeStart = buckets[2 * bucket];
   let rangeEnd = buckets[2 * bucket + 1];
-  tint.y = f32(rangeEnd - rangeStart) / 10.;
+  // tint.y = f32(rangeEnd - rangeStart) / 10.;
   // tint.y = f32(rangeStart) / 300.;
   // tint.z = f32(rangeEnd) / 300.;
   // tint.y = f32(range.start) / 1000.;
