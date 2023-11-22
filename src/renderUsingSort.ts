@@ -595,6 +595,7 @@ ${COMMON_DEFS}
 @group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(0) var<storage> renderables: array<ProjectedGaussian>;
 @group(1) @binding(1) var<uniform> slice: Slice;
+@group(1) @binding(2) var<storage, read> buckets: array<u32>;
 
 override chunkSize: u32 = 16;
 
@@ -603,16 +604,26 @@ fn renderGaussians(
   @builtin(workgroup_id) chunkPosition: vec3u,
   @builtin(local_invocation_id) offset: vec3u,
   @builtin(global_invocation_id) pixel: vec3u,
+  @builtin(num_workgroups) chunkDims: vec3u,
 ) {
   let coords = 2 * vec2f(pixel.xy) / vec2f(textureDimensions(outputTexture)) - 1;
   var color = vec4f(0, 0, 0, 0);
 
-  let end = slice.offset + slice.length;
-  for (var i = slice.offset; i < end; i++) {
-    let in = renderables[i];
+  // for now, to avoid all the overflow stuff, just skip the edges
+  if (chunkPosition.x == 0 || chunkPosition.x + 1 == chunkDims.x || chunkPosition.y == 0 || chunkPosition.y + 1 == chunkDims.y) {
+    return;
+  }
+
+  let chunkId = chunkPosition.y * chunkDims.x + chunkPosition.x;
+
+  let start = buckets[2 * chunkId];
+  let end = buckets[2 * chunkId + 1];
+
+  for (var i = start; i < end; i++) {
+    let in = renderables[slice.offset + i];
     let origin = in.origin;
 
-    if (origin.z < 0.1) {
+    if (origin.z < 0.01) {
       continue;
     }
 
@@ -891,6 +902,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
+            { binding: 2, resource: { buffer: bucketRangesBuffer } },
           ],
         }),
       ];
