@@ -53,7 +53,7 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
 
   let numSplats =
     (fileBytes.byteLength - bodyIndex) / NUM_BYTES_FLOAT32 / NUM_PROPERTIES_PLY;
-  numSplats = Math.min(numSplats, 1000);
+  numSplats = Math.min(numSplats, 250);
 
   const USE_OLD_RENDER = false;
 

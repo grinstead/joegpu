@@ -4,7 +4,7 @@ import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
 
-const SORT_TILE_SIZE = 512;
+const TILE_SIZE = 512;
 const NUM_BUCKETS = 256;
 
 const HISTOGRAM_SIZE = NUM_BUCKETS * NUM_BYTES_UINT32;
@@ -25,6 +25,9 @@ struct ProjectedGaussian {
   color: vec4f,
 }
 `;
+
+const NUM_BYTES_PROJECTED_GAUSSIAN = 12 * NUM_BYTES_FLOAT32;
+const NUM_BYTES_TILE = TILE_SIZE * NUM_BYTES_PROJECTED_GAUSSIAN;
 
 export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
   const { canvas, context, device, format } = props;
@@ -104,7 +107,7 @@ fn normalize_opacity(in: f32) -> f32 {
 const chunkDims = vec2f(16. / 512, 16. / 512);
 const chunksPerRow = u32(1. / chunkDims.y);
 
-override blockSize: u32 = 16;
+override blockSize: u32 = 256;
 @compute @workgroup_size(blockSize)
 fn projectGaussians(
   @builtin(global_invocation_id) index: vec3u,
@@ -113,7 +116,7 @@ fn projectGaussians(
     return;
   }
 
-  let in = gaussians[index.x + slice.offset];
+  let in = gaussians[slice.offset + index.x];
 
   let camera_space_origin = camera * vec4<f32>(in.origin[0], in.origin[1], in.origin[2], 1.0);
   let z = camera_space_origin.z;
@@ -165,15 +168,15 @@ fn projectGaussians(
     saturate((screenSpace.xy + 1) / 2) / chunkDims
   );
 
-  projectedGaussians[index.x] = ProjectedGaussian(
+  projectedGaussians[slice.offset + index.x] = ProjectedGaussian(
     screenSpace,
-    insertBits(
-      u32(clamp(screenSpace.z, 0, (1 << 3) - .0001) * (1 << 13)),
-      min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
-      16,
-      16,
-    ),
-    // min(chunkId.y, 31) * 256 + min(chunkId.x, 31),
+    index.x << 18,
+    // insertBits(
+    //   1 + min(u32(max(0, screenSpace.z) * (1 << 13)), (1 << 16) - 2),
+    //   min(chunkId.y, 31) * chunksPerRow + min(chunkId.x, 31),
+    //   16,
+    //   16,
+    // ),
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -207,8 +210,9 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 @group(0) @binding(2) var<storage, read_write> globalHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES>;
 @group(0) @binding(3) var<storage, read_write> nextTileStart: atomic<u32>;
 
-override blockSize: u32 = 128;
+override blockSize: u32 = 256;
 override itemsPerThreadPerTile: u32 = 16;
+override tileLength: u32 = blockSize * itemsPerThreadPerTile;
 
 var<workgroup> workgroupStart: u32;
 var<workgroup> localHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES>;
@@ -218,12 +222,10 @@ var<workgroup> localHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES
 fn computeBinSizes(
   @builtin(local_invocation_index) localIndex: u32,
 ) {  
-  let tileSize = itemsPerThreadPerTile * blockSize;
-
   // loop through "tiles"
   loop {
     if (localIndex == 0) {
-      workgroupStart = atomicAdd(&nextTileStart, tileSize);
+      workgroupStart = atomicAdd(&nextTileStart, tileLength);
     }
 
     let tileStart = workgroupUniformLoad(&workgroupStart);
@@ -231,23 +233,29 @@ fn computeBinSizes(
       break;
     }
 
-    let end = slice.offset + min(slice.length, tileStart + tileSize);
-
+    let end = min(slice.length, tileStart + tileLength);
     for (
-      var i: u32 = slice.offset + tileStart + localIndex;
+      var i: u32 = tileStart + localIndex;
       i < end;
       i += blockSize
     ) {
-      let key = gaussians[i].sortKey;
+      let key = gaussians[slice.offset + i].sortKey;
       
       for (var round: u32 = 0; round < NUM_PASSES; round++) {
         let subkey = extractBits(
-          key,
+          select(0xFFFFFFFF, key, key != 0),
           round * NUM_BITS_PER_BUCKET,
           NUM_BITS_PER_BUCKET
         );
         atomicAdd(&localHistogram[round][subkey], 1);
       }
+    }
+
+    // any space in the tile after the end of the gaussians will be treated as having
+    // a 0 sort key (which gets sorted to the end of the array)
+    if (end < tileStart + tileLength && localIndex < 4) {
+      // the first 4 threads in the block write simultaneously
+      atomicAdd(&localHistogram[localIndex][0xFF], tileStart + tileLength - end);
     }
   }
 
@@ -323,6 +331,10 @@ fn exclusivePrefixSum(
     size: 2 * NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
   });
+  const projectedSliceBuffer = device.createBuffer({
+    size: 2 * NUM_BYTES_UINT32,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
+  });
 
   const sortPipeline = device.createComputePipeline({
     layout: "auto",
@@ -340,7 +352,18 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 @group(0) @binding(0) var<storage, read> input: array<ProjectedGaussian>;
 @group(0) @binding(1) var<storage, read_write> output: array<ProjectedGaussian>;
+
+/**
+ * Stores the starting index of each key-bucket for the tile _after_ the
+ * inspected tile. In other words, the first histogram will be set to the global
+ * histogram plus the number of each key within the first tile.
+ */
 @group(0) @binding(2) var<storage, read_write> localHistograms: array<array<atomic<u32>, NUM_BUCKETS>>;
+
+/**
+ * The slice of the input array we are reading from.
+ * THE LENGTH MUST BE A MULTIPLE OF tileLength
+ */
 @group(1) @binding(0) var<uniform> slice: Slice;
 @group(1) @binding(1) var<storage, read> globalHistogram: array<u32, NUM_BUCKETS>;
 @group(1) @binding(2) var<storage, read_write> nextTileIndex: atomic<u32>;
@@ -348,14 +371,19 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 const blockSize: u32 = 32;
 const itemsPerThreadPerTile: u32 = 16;
-const targetTileSize = itemsPerThreadPerTile * blockSize;
+const tileLength = itemsPerThreadPerTile * blockSize;
 
 const LOCAL_RESOLVED_FLAG: u32 = 1 << 30;
 const GLOBAL_RESOLVED_FLAG: u32 = 1 << 31;
 const VALUE_MASK: u32 = ~(LOCAL_RESOLVED_FLAG | GLOBAL_RESOLVED_FLAG);
 
 var<workgroup> tileIndex: u32;
+
+/**
+ * Contains the inclusive prefix sum.
+ */
 var<workgroup> prefixSum: array<u32, NUM_BUCKETS>;
+
 var<workgroup> scratchpad: array<u32, blockSize * itemsPerThreadPerTile>;
 
 @compute @workgroup_size(blockSize)
@@ -366,12 +394,16 @@ fn sortProjections(
     tileIndex = atomicAdd(&nextTileIndex, 1);
   }
 
-  let tileStart = workgroupUniformLoad(&tileIndex) * targetTileSize;
-  let tileLength: u32 = min(targetTileSize, slice.length - tileStart);
+  let tileStart = workgroupUniformLoad(&tileIndex) * tileLength;
 
+  // this for loop will set the scratchpad to contain a bunch of
+  // key-concat-index u32 values that we will then sort. While looping, we add
+  // to the local histogram value to keep track of how many of each key we see.
+  // We use the local histogram because it's already allocated ram.
   for (var i = localIndex; i < tileLength; i += blockSize) {
+    let sortKey = input[slice.offset + tileStart + i].sortKey;
     let key = extractBits(
-      input[slice.offset + tileStart + i].sortKey,
+      select(0xFFFFFFFF, sortKey, sortKey != 0),
       passIndex * NUM_BITS_PER_BUCKET, 
       NUM_BITS_PER_BUCKET
     );
@@ -385,9 +417,9 @@ fn sortProjections(
   // as long as this assert is true, we know that j + localIndex will not overflow
   const_assert (NUM_BUCKETS % blockSize == 0);
 
-  // write the initial values in
-  for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
-    prefixSum[index] = atomicLoad(&localHistograms[tileIndex][index]);
+  // Load up how much of each bucket there is
+  for (var key: u32 = localIndex; key < NUM_BUCKETS; key += blockSize) {
+    prefixSum[key] = atomicLoad(&localHistograms[tileIndex][key]);
   }
 
   // add all the values together as necessary
@@ -396,45 +428,46 @@ fn sortProjections(
       let index = j + localIndex;
 
       var earlierSum: u32 = 0;
-      if (i <= index) {
+      workgroupBarrier();
+      if (index >= i) {
         earlierSum = prefixSum[index - i];
       }
-      workgroupBarrier();
 
+      workgroupBarrier();
       prefixSum[index] += earlierSum;
-      workgroupBarrier();
     }
+
+    workgroupBarrier();
   }
 
-  // subtract out the local bucket size
-  for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
-    var exclusiveSum = prefixSum[index] - atomicLoad(&localHistograms[tileIndex][index]);
+  // at this point, the prefixSum array contains the (inclusive) prefix sum
 
+  // write out that info to the wider histograms
+  for (var key: u32 = localIndex; key < NUM_BUCKETS; key += blockSize) {
+    var sum: u32;
     if (tileIndex == 0) {
-      exclusiveSum += globalHistogram[index];
+      sum = GLOBAL_RESOLVED_FLAG + globalHistogram[key];
+    } else {
+      sum = LOCAL_RESOLVED_FLAG;
     }
 
-    prefixSum[index] = exclusiveSum;
-
-    atomicStore(
-      &localHistograms[tileIndex][index],
-      exclusiveSum + select(LOCAL_RESOLVED_FLAG, GLOBAL_RESOLVED_FLAG, tileIndex == 0)
-    );
+    atomicStore(&localHistograms[tileIndex][key], sum + prefixSum[key]);
   }
 
-  // write to the global histogram
+  // write to the shared-memory local histograms
   if (tileIndex > 0) {
-    for (var index: u32 = localIndex; index < NUM_BUCKETS; index += blockSize) {
-      var sum = prefixSum[index];
+    for (var key: u32 = localIndex; key < NUM_BUCKETS; key += blockSize) {
+      var sum = prefixSum[key];
+
+      var loopCount: u32 = 0;
 
       var prevTile: u32 = tileIndex - 1;
       loop {
-        let prevValue = atomicLoad(&localHistograms[prevTile][index]);
+        let prevValue = atomicLoad(&localHistograms[prevTile][key]);
 
         if ((prevValue & GLOBAL_RESOLVED_FLAG) != 0) {
-          // it comes with the flag bit, sort of convenient
-          sum += prevValue;
-          atomicStore(&localHistograms[tileIndex][index], sum);
+          // the prevValue comes with the flag bit, sort of convenient
+          atomicStore(&localHistograms[tileIndex][key], sum + prevValue);
           break;
         } else if ((prevValue & LOCAL_RESOLVED_FLAG) != 0) {
           sum += (prevValue & VALUE_MASK);
@@ -444,12 +477,21 @@ fn sortProjections(
           prevTile--;
         } else {
           // loop back on this tile
+
+          loopCount++;
+          if (loopCount > 10000) {
+            // prevents freezing the computer if something goes wrong
+            // this case should never be hit
+            break;
+          }
         }
       }
-
-      prefixSum[index] = sum;
     }
   }
+
+  // at this point, prefixSum is the inclusive prefixSum
+  // and the value in localHistograms is the global value for
+  // how large each bucket is inclusive of this tile
 
   workgroupBarrier();
 
@@ -474,21 +516,74 @@ fn sortProjections(
     }
   }
 
-  for (var i = localIndex; i < tileLength; i += blockSize) {
-    let keyAndIndex = scratchpad[i];
-    let key = extractBits(keyAndIndex, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
-    let index = extractBits(keyAndIndex, 0, 32 - NUM_BITS_PER_BUCKET);
+  // now the scratchpad is sorted
 
-    output[slice.offset + tileStart + i] = input[
+  for (var i = localIndex; i < tileLength; i += blockSize) {
+    let keyAndIndex: u32 = scratchpad[i];
+    let key: u32 = extractBits(keyAndIndex, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
+    let index: u32 = extractBits(keyAndIndex, 0, 32 - NUM_BITS_PER_BUCKET);
+
+    let bucketEnd = atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK;
+
+    output[
+      slice.offset + i
+      //bucketEnd + (prefixSum[key] - i)
+    ] = input[
       slice.offset +
       tileStart +
-      (atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK) +
-      (index - prefixSum[key])
+      index
     ];
   }
 }
 
   `,
+      }),
+    },
+  });
+
+  const bucketizePipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      entryPoint: "findBucketIndices",
+      module: device.createShaderModule({
+        label: "Shader to determine start indices of each bucket",
+        code: `
+${PROJECTED_GUASSIAN_DEF}
+${COMMON_DEFS}
+
+@group(0) @binding(0) var<storage> gaussians: array<ProjectedGaussian>;
+@group(0) @binding(1) var<storage, read_write> buckets: array<u32>;
+@group(0) @binding(2) var<uniform> slice: Slice;
+
+override blockSize: u32 = 256;
+override bitsForIndex: u32 = 16;
+
+fn bucketOf(index: u32) -> u32 {
+  return gaussians[slice.offset + index].sortKey >> (32 - bitsForIndex);
+}
+
+@compute @workgroup_size(blockSize)
+fn findBucketIndices(
+  @builtin(global_invocation_id) globalIndex: vec3u,
+) {
+  let index = globalIndex.x;
+  if (index >= slice.length) {
+    return;
+  }
+
+  let key = bucketOf(index);
+
+  if (index == 0 || bucketOf(index - 1) < key) {
+    buckets[2 * key] = index;
+  }
+
+  if (index + 1 == slice.length || key < bucketOf(index + 1)) {
+    buckets[2 * key + 1] = index + 1;
+  }
+}
+
+        
+        `,
       }),
     },
   });
@@ -567,15 +662,20 @@ fn renderGaussians(
   let binSizingDataBindGroups: undefined | Array<GPUBindGroup>;
   let histogramsBuffer: undefined | GPUBuffer;
   let sortPassDataBindGroups: undefined | Array<Array<GPUBindGroup>>;
+  let bucketRangesBuffer: undefined | GPUBuffer;
+  let bucketizeDataBindGroups: undefined | Array<GPUBindGroup>;
   let renderDataBindGroups: undefined | Array<GPUBindGroup>;
 
   // creates a shader that needs to draw 4 points, one for each corner of the screen
   const outputShader = device.createShaderModule({
     label: "Single Texture Shader",
     code: `
+${COMMON_DEFS}
+
 @group(0) @binding(0) var screenSampler: sampler;
 @group(0) @binding(1) var screenTexture: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read> debug_histogram: array<array<u32, 256>, 4>;
+// @group(0) @binding(2) var<storage, read> debug_histogram: array<array<u32, 256>, 4>;
+@group(0) @binding(2) var<storage, read> buckets: array<u32>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -608,17 +708,15 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   // let bucket = u32(floor(fragUV.y / dim)) * 32 + u32(floor(fragUV.x / dim));
   var tint = vec4f(0, 0, 0, 1);
 
-  if (fragUV.x < dim) {
-    tint.x = f32(debug_histogram[3][u32(fragUV.y / dim)]) / 1000.;
-  } else if (fragUV.x >= 1 - dim) {
-    tint.x = f32(debug_histogram[1][u32(256 * fragUV.y)]) / 1000.;
-  }
-
-  if (fragUV.y < dim) {
-    tint.y = f32(debug_histogram[2][u32(fragUV.x / dim)]) / 1000.;
-  } else if (fragUV.y >= 1 - dim) {
-    tint.y = f32(debug_histogram[0][u32(256 * fragUV.x)]) / 1000.;
-  }
+  let bucket = u32(fragUV.y / dim) * 32 + u32(fragUV.x / dim);
+  let rangeStart = buckets[2 * bucket];
+  let rangeEnd = buckets[2 * bucket + 1];
+  // tint.y = f32(rangeEnd - rangeStart) / 10.;
+  tint.y = f32(rangeStart) / 300.;
+  // tint.z = f32(rangeEnd) / 300.;
+  // tint.y = f32(range.start) / 1000.;
+  // tint.y = f32(range.end) / 1024.;
+  // tint.y = select(0., 1., buckets[bucket + 1].start == range.end);
 
   let color = textureSample(screenTexture, screenSampler, fragUV);
   
@@ -652,21 +750,23 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     entries: [{ binding: 0, resource: { buffer: histogramBuffer } }],
   });
 
-  const renderTextureBindGroup = device.createBindGroup({
-    layout: screenPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: outputSampler },
-      {
-        binding: 1,
-        resource: outputTexture.createView(),
-      },
-      { binding: 2, resource: { buffer: histogramBuffer } },
-    ],
-  });
+  let renderTextureBindGroup: undefined | GPUBindGroup;
+  // const renderTextureBindGroup = device.createBindGroup({
+  //   layout: screenPipeline.getBindGroupLayout(0),
+  //   entries: [
+  //     { binding: 0, resource: outputSampler },
+  //     {
+  //       binding: 1,
+  //       resource: outputTexture.createView(),
+  //     },
+  //     { binding: 2, resource: { buffer: histogramBuffer } },
+  //   ],
+  // });
 
   return render;
 
   function render(numSplats: number, cameraMatrix: Float32Array) {
+    const numTiles = Math.ceil(numSplats / TILE_SIZE);
     const encoder = device.createCommandEncoder();
 
     if (numSplats !== projectedGaussianBufferSize) {
@@ -674,11 +774,24 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         buffer.destroy();
       });
       histogramsBuffer?.destroy();
+      bucketRangesBuffer?.destroy();
+
+      writeToBuffer(
+        device.queue,
+        dataSliceBuffer,
+        new Uint32Array([0, numSplats])
+      );
+
+      writeToBuffer(
+        device.queue,
+        projectedSliceBuffer,
+        new Uint32Array([0, numTiles * TILE_SIZE])
+      );
 
       projectedGaussianBuffers = ["", " (scratch-space)"].map((name) =>
         device.createBuffer({
           label: `Projected Gaussians Buffer${name} (size ${numSplats})`,
-          size: numSplats * 12 * NUM_BYTES_FLOAT32,
+          size: numTiles * NUM_BYTES_TILE,
           usage: GPUBufferUsage.STORAGE,
         })
       );
@@ -698,10 +811,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
       histogramsBuffer = device.createBuffer({
         label: `Local Histograms used in Sorting`,
-        size:
-          Math.ceil(numSplats / SORT_TILE_SIZE) *
-          NUM_BUCKETS *
-          NUM_BYTES_UINT32,
+        size: numTiles * NUM_BUCKETS * NUM_BYTES_UINT32,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
 
@@ -736,7 +846,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBindGroup({
           layout: sortPipeline.getBindGroupLayout(1),
           entries: [
-            { binding: 0, resource: { buffer: dataSliceBuffer } },
+            { binding: 0, resource: { buffer: projectedSliceBuffer } },
             {
               binding: 1,
               resource: {
@@ -756,6 +866,24 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         }),
       ]);
 
+      bucketRangesBuffer = device.createBuffer({
+        label: `An array holding bucket ranges`,
+        size: chunkDims.y * chunkDims.x * 2 * NUM_BYTES_UINT32,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+
+      bucketizeDataBindGroups = [
+        device.createBindGroup({
+          label: "Bucketize Bind Group",
+          layout: bucketizePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[1] } },
+            { binding: 1, resource: { buffer: bucketRangesBuffer } },
+            { binding: 2, resource: { buffer: dataSliceBuffer } },
+          ],
+        }),
+      ];
+
       renderDataBindGroups = [
         guassianBindGroup,
         device.createBindGroup({
@@ -766,6 +894,18 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           ],
         }),
       ];
+
+      renderTextureBindGroup = device.createBindGroup({
+        layout: screenPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: outputSampler },
+          {
+            binding: 1,
+            resource: outputTexture.createView(),
+          },
+          { binding: 2, resource: { buffer: bucketRangesBuffer } },
+        ],
+      });
     }
 
     writeToBuffer(device.queue, cameraBuffer, cameraMatrix);
@@ -775,18 +915,12 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     projectedDataBindGroups!.forEach((group, i) => {
       projectionPass.setBindGroup(i, group);
     });
-    projectionPass.dispatchWorkgroups(Math.ceil(numSplats / CHUNK_SIZE));
+    projectionPass.dispatchWorkgroups(Math.ceil(numSplats / 256));
     projectionPass.end();
 
     // reset the histogram
     encoder.clearBuffer(histogramBuffer);
     encoder.clearBuffer(nextTileIndexBuffer);
-
-    writeToBuffer(
-      device.queue,
-      dataSliceBuffer,
-      new Uint32Array([0, numSplats])
-    );
 
     const binSizingPass = encoder.beginComputePass();
     binSizingPass.setPipeline(binSizingPipeline);
@@ -814,9 +948,19 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       groups.forEach((group, i) => {
         sortPass.setBindGroup(i, group);
       });
-      sortPass.dispatchWorkgroups(Math.ceil(numSplats / SORT_TILE_SIZE));
+      sortPass.dispatchWorkgroups(numTiles);
       sortPass.end();
     });
+
+    encoder.clearBuffer(bucketRangesBuffer!);
+
+    const bucketizePass = encoder.beginComputePass();
+    bucketizePass.setPipeline(bucketizePipeline);
+    bucketizeDataBindGroups!.forEach((group, i) => {
+      bucketizePass.setBindGroup(i, group);
+    });
+    bucketizePass.dispatchWorkgroups(Math.ceil(numSplats / 256));
+    bucketizePass.end();
 
     const guassianPass = encoder.beginComputePass();
     guassianPass.setPipeline(guassianPipeline);
@@ -837,7 +981,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     });
 
     outputPass.setPipeline(screenPipeline);
-    outputPass.setBindGroup(0, renderTextureBindGroup);
+    outputPass.setBindGroup(0, renderTextureBindGroup!);
     outputPass.draw(4);
     outputPass.end();
 
