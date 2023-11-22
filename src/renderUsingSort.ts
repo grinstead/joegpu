@@ -413,50 +413,21 @@ fn sortProjections(
     scratchpad[i] = insertBits(i, key, 32 - NUM_BITS_PER_BUCKET, NUM_BITS_PER_BUCKET);
   }
 
-  // as long as this assert is true, we know that j + localIndex will not overflow
-  const_assert (NUM_BUCKETS % blockSize == 0);
+  workgroupBarrier();
 
   // Load up how much of each bucket there is
   for (var key: u32 = localIndex; key < NUM_BUCKETS; key += blockSize) {
-    prefixSum[key] = atomicLoad(&localHistograms[tileIndex][key]);
-  }
+    // this sum is currently how many values we have for that key
+    var sum = atomicLoad(&localHistograms[tileIndex][key]);
 
-  // add all the values together as necessary
-  for (var i: u32 = 1; i < NUM_BUCKETS; i *= 2) {
-    for (var j: u32 = 0; j < NUM_BUCKETS; j += blockSize) {
-      let index = j + localIndex;
-
-      var earlierSum: u32 = 0;
-      workgroupBarrier();
-      if (index >= i) {
-        earlierSum = prefixSum[index - i];
-      }
-
-      workgroupBarrier();
-      prefixSum[index] += earlierSum;
-    }
-
-    workgroupBarrier();
-  }
-
-  // at this point, the prefixSum array contains the (inclusive) prefix sum
-
-  // write out that info to the wider histograms
-  for (var key: u32 = localIndex; key < NUM_BUCKETS; key += blockSize) {
-    var sum: u32;
+    // will get turned into prefix sum later
+    prefixSum[key] = sum;
+    
     if (tileIndex == 0) {
-      sum = GLOBAL_RESOLVED_FLAG + globalHistogram[key];
+      sum += GLOBAL_RESOLVED_FLAG + globalHistogram[key];
     } else {
-      sum = LOCAL_RESOLVED_FLAG;
-    }
-
-    atomicStore(&localHistograms[tileIndex][key], sum + prefixSum[key]);
-  }
-
-  // write to the shared-memory local histograms
-  if (tileIndex > 0) {
-    for (var key: u32 = localIndex; key < NUM_BUCKETS; key += blockSize) {
-      var sum = prefixSum[key];
+      // save our current value, which allows other blocks to see it
+      atomicStore(&localHistograms[tileIndex][key], LOCAL_RESOLVED_FLAG + sum);
 
       var loopCount: u32 = 0;
 
@@ -466,7 +437,7 @@ fn sortProjections(
 
         if ((prevValue & GLOBAL_RESOLVED_FLAG) != 0) {
           // the prevValue comes with the flag bit, sort of convenient
-          atomicStore(&localHistograms[tileIndex][key], sum + prevValue);
+          sum += prevValue;
           break;
         } else if ((prevValue & LOCAL_RESOLVED_FLAG) != 0) {
           sum += (prevValue & VALUE_MASK);
@@ -486,13 +457,37 @@ fn sortProjections(
         }
       }
     }
+
+    // store our globally resolved value
+    atomicStore(&localHistograms[tileIndex][key], sum);
+  }
+
+  workgroupBarrier();
+
+  // as long as this assert is true, we know that looping backwards from NUM_BUCKETS will hit exactly 0
+  const_assert (NUM_BUCKETS % blockSize == 0);
+
+  // perform inclusive prefix sum
+  for (var i: u32 = 1; i < NUM_BUCKETS; i *= 2) {
+    // we start from the back so that we don't mess up 
+    // later data with earlier writes
+    for (var j: u32 = NUM_BUCKETS; j != 0; j -= blockSize) {
+      let key = j - blockSize + localIndex;
+
+      var earlierSum: u32 = 0;
+      if (key >= i) {
+        earlierSum = prefixSum[key - i];
+      }
+      workgroupBarrier();
+
+      prefixSum[key] += earlierSum;
+      workgroupBarrier();
+    }
   }
 
   // at this point, prefixSum is the inclusive prefixSum
   // and the value in localHistograms is the global value for
   // how large each bucket is inclusive of this tile
-
-  workgroupBarrier();
 
   // copied from wikipedia pseudo-code
   // https://en.wikipedia.org/wiki/Bitonic_sorter
@@ -525,8 +520,8 @@ fn sortProjections(
     let bucketEnd = atomicLoad(&localHistograms[tileIndex][key]) & VALUE_MASK;
 
     output[
-      slice.offset + i
-      // bucketEnd + (prefixSum[key] - i)
+      slice.offset +
+      bucketEnd - (prefixSum[key] - i)
     ] = input[
       slice.offset +
       tileStart +
@@ -675,6 +670,7 @@ ${COMMON_DEFS}
 @group(0) @binding(1) var screenTexture: texture_2d<f32>;
 // @group(0) @binding(2) var<storage, read> debug_histogram: array<array<u32, 256>, 4>;
 @group(0) @binding(2) var<storage, read> buckets: array<u32>;
+@group(0) @binding(3) var<storage, read> localHistograms: array<array<u32, 256>>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -708,6 +704,11 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   var tint = vec4f(0, 0, 0, 1);
 
   let bucket = u32(fragUV.y / dim) * 32 + u32(fragUV.x / dim);
+
+  _ = localHistograms[0][0];
+  // tint.x = f32(localHistograms[0][u32(fragUV.x * 256)] & 0x3FFFFFFF) / 300.;
+  // tint.x = f32(localHistograms[0][bucket >> 8] & 0x3FFFFFFF) / 300.;
+
   let rangeStart = buckets[2 * bucket];
   let rangeEnd = buckets[2 * bucket + 1];
   tint.y = f32(rangeEnd - rangeStart) / 10.;
@@ -728,7 +729,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     label: "Basic Texture Sampler",
   });
 
-  const screenPipeline = device.createRenderPipeline({
+  const renderTexturePipeline = device.createRenderPipeline({
     layout: "auto",
     vertex: {
       module: outputShader,
@@ -895,7 +896,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       ];
 
       renderTextureBindGroup = device.createBindGroup({
-        layout: screenPipeline.getBindGroupLayout(0),
+        layout: renderTexturePipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: outputSampler },
           {
@@ -903,6 +904,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
             resource: outputTexture.createView(),
           },
           { binding: 2, resource: { buffer: bucketRangesBuffer } },
+          { binding: 3, resource: { buffer: histogramsBuffer } },
         ],
       });
     }
@@ -938,7 +940,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     prefixSumPass.dispatchWorkgroups(4);
     prefixSumPass.end();
 
-    sortPassDataBindGroups!.forEach((groups) => {
+    sortPassDataBindGroups!.forEach((groups, i) => {
       encoder.clearBuffer(nextTileIndexBuffer);
       encoder.clearBuffer(histogramsBuffer!);
 
@@ -979,7 +981,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       ],
     });
 
-    outputPass.setPipeline(screenPipeline);
+    outputPass.setPipeline(renderTexturePipeline);
     outputPass.setBindGroup(0, renderTextureBindGroup!);
     outputPass.draw(4);
     outputPass.end();
