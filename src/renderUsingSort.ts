@@ -170,13 +170,12 @@ fn projectGaussians(
 
   projectedGaussians[slice.offset + index.x] = ProjectedGaussian(
     screenSpace,
-    index.x << 18,
-    // insertBits(
-    //   1 + min(u32(max(0, screenSpace.z) * (1 << 13)), (1 << 16) - 2),
-    //   min(chunkId.y, 31) * chunksPerRow + min(chunkId.x, 31),
-    //   16,
-    //   16,
-    // ),
+    insertBits(
+      1 + min(u32(max(0, screenSpace.z) * (1 << 13)), (1 << 16) - 2),
+      min(chunkId.y, 31) * chunksPerRow + min(chunkId.x, 31),
+      16,
+      16,
+    ),
     vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -527,7 +526,7 @@ fn sortProjections(
 
     output[
       slice.offset + i
-      //bucketEnd + (prefixSum[key] - i)
+      // bucketEnd + (prefixSum[key] - i)
     ] = input[
       slice.offset +
       tileStart +
@@ -711,8 +710,8 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   let bucket = u32(fragUV.y / dim) * 32 + u32(fragUV.x / dim);
   let rangeStart = buckets[2 * bucket];
   let rangeEnd = buckets[2 * bucket + 1];
-  // tint.y = f32(rangeEnd - rangeStart) / 10.;
-  tint.y = f32(rangeStart) / 300.;
+  tint.y = f32(rangeEnd - rangeStart) / 10.;
+  // tint.y = f32(rangeStart) / 300.;
   // tint.z = f32(rangeEnd) / 300.;
   // tint.y = f32(range.start) / 1000.;
   // tint.y = f32(range.end) / 1024.;
@@ -877,7 +876,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           label: "Bucketize Bind Group",
           layout: bucketizePipeline.getBindGroupLayout(0),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffers[1] } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: bucketRangesBuffer } },
             { binding: 2, resource: { buffer: dataSliceBuffer } },
           ],
@@ -889,7 +888,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBindGroup({
           layout: guassianPipeline.getBindGroupLayout(1),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffers[1] } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
           ],
         }),
@@ -939,7 +938,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     prefixSumPass.dispatchWorkgroups(4);
     prefixSumPass.end();
 
-    sortPassDataBindGroups!.forEach((groups, i) => {
+    sortPassDataBindGroups!.forEach((groups) => {
       encoder.clearBuffer(nextTileIndexBuffer);
       encoder.clearBuffer(histogramsBuffer!);
 
