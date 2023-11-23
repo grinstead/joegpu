@@ -1,5 +1,5 @@
 import { GPUCanvasDetails } from "./GPUCanvas.tsx";
-import { writeToBuffer } from "./gpu_utils.ts";
+import { COMMON_DEFS, writeToBuffer } from "./gpu_utils.ts";
 import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
@@ -8,13 +8,6 @@ const TILE_SIZE = 512;
 const NUM_BUCKETS = 256;
 
 const HISTOGRAM_SIZE = NUM_BUCKETS * NUM_BYTES_UINT32;
-
-const COMMON_DEFS = `
-struct Slice {
-  offset: u32,
-  length: u32,
-}
-`;
 
 const PROJECTED_GUASSIAN_DEF = `
 struct ProjectedGaussian {

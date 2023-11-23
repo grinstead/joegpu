@@ -6,6 +6,13 @@ export const QUAD_VERTICES = [
    1,  1,
 ];
 
+export const COMMON_DEFS = `
+struct Slice {
+  offset: u32,
+  length: u32,
+}
+`;
+
 export function writeToBuffer(
   queue: GPUQueue,
   buffer: GPUBuffer,
