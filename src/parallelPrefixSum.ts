@@ -20,7 +20,7 @@ override tileLength: u32 = 2 * workgroupSize;
 
 @group(0) @binding(0) var<storage, read_write> tileAccs: array<u32>;
 @group(1) @binding(0) var<storage, read_write> values: array<u32>;
-@group(1) @binding(0) var<uniform> slice: Slice;
+@group(1) @binding(1) var<uniform> slice: Slice;
 
 var<workgroup> accumulators: array<u32, tileLength>;
 
@@ -49,7 +49,7 @@ fn parallelPrefixSum(
 
     for (var i: u32 = localIndex; i < numThreads; i += workgroupSize) {
       let lower = delta * (2 * i + 1) - 1;
-      accumulators[lower] += accumulators[lower + delta];
+      accumulators[lower + delta] += accumulators[lower];
     }
 
     delta *= 2;
@@ -63,15 +63,16 @@ fn parallelPrefixSum(
     accumulators[tileLength - 1] = 0;
   }
 
-  for (int numThreads = 1; numThreads < tileLength; numThreads *= 2) {
+  for (var numThreads: u32 = 1; numThreads < tileLength; numThreads *= 2) {
     delta /= 2;
 
     workgroupBarrier();
     for (var i: u32 = localIndex; i < numThreads; i += workgroupSize) {
       let lower = delta * (2 * i + 1) - 1;
-      let temp = accumulators[lower];
-      accumulators[lower] = accumulators[lower + delta];
-      accumulators[lower + delta] = accumulators[lower];
+      let a = accumulators[lower];
+      let b = accumulators[lower + delta];
+      accumulators[lower] = b;
+      accumulators[lower + delta] = a + b;
     }
   }
 
@@ -87,7 +88,7 @@ fn parallelPrefixSum(
 
 @compute @workgroup_size(256)
 fn addGlobalOffsets(
-  @builtin(global_invocation_id) index: u32,
+  @builtin(global_invocation_id) index: vec3u,
 ) {
   if (index.x >= slice.length) {
     return;
@@ -150,7 +151,8 @@ fn addGlobalOffsets(
   const tileAccsSliceBuffer = device.createBuffer({
     label: "The Slice of tileAccs that is valid",
     size: 2 * NUM_BYTES_UINT32,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    usage:
+      GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE,
   });
 
   writeToBuffer(
@@ -187,6 +189,7 @@ fn addGlobalOffsets(
   let userBindings:
     | undefined
     | {
+        buffers: PrefixSumBuffers;
         tileScansBinding: GPUBindGroup;
         addGlobalOffsetsBinding: GPUBindGroup;
       };
@@ -194,6 +197,7 @@ fn addGlobalOffsets(
   return {
     prep(buffers: PrefixSumBuffers) {
       userBindings = {
+        buffers,
         tileScansBinding: device.createBindGroup({
           layout: tileScans.getBindGroupLayout(1),
           entries: [
@@ -219,6 +223,8 @@ fn addGlobalOffsets(
       throw new Error("Must call prep before running");
     }
 
+    if (!numItems) return;
+
     encoder.clearBuffer(tileAccs);
 
     const tileScansPass = encoder.beginComputePass();
@@ -226,6 +232,9 @@ fn addGlobalOffsets(
     tileScansPass.setBindGroup(0, tileScansBinding);
     tileScansPass.setBindGroup(1, userBindings.tileScansBinding);
     tileScansPass.dispatchWorkgroups(Math.ceil(numItems / DEFAULT_TILE_SIZE));
+    tileScansPass.end();
+
+    if (numItems <= DEFAULT_TILE_SIZE) return;
 
     const crossTileScansPass = encoder.beginComputePass();
     crossTileScansPass.setPipeline(crossTileScans);
@@ -233,11 +242,13 @@ fn addGlobalOffsets(
       crossTileScansPass.setBindGroup(i, group);
     });
     crossTileScansPass.dispatchWorkgroups(1);
+    crossTileScansPass.end();
 
     const addGlobalOffsetsPass = encoder.beginComputePass();
     addGlobalOffsetsPass.setPipeline(addGlobalOffsets);
     addGlobalOffsetsPass.setBindGroup(0, addGlobalOffsetsBinding);
     addGlobalOffsetsPass.setBindGroup(1, userBindings.addGlobalOffsetsBinding);
     addGlobalOffsetsPass.dispatchWorkgroups(Math.ceil(numItems / 256));
+    addGlobalOffsetsPass.end();
   }
 }

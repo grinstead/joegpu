@@ -8,6 +8,7 @@ import { NUM_PROPERTIES_PLY } from "./ply.ts";
 import { renderUsingQuads } from "./renderUsingQuads.ts";
 import { MutatingMatrix } from "./matrix.ts";
 import { renderUsingSort } from "./renderUsingSort.ts";
+import { testParallelPrefixSum } from "./parallelPrefixSum.test.ts";
 
 type Point = { x: number; y: number };
 
@@ -50,6 +51,8 @@ async function renderAppCanvas(props: GPUCanvasDetails) {
     "end_header\n".length;
 
   const { device, canvas } = props;
+
+  (window as any).testPrefixSum = () => testParallelPrefixSum(device);
 
   let numSplats =
     (fileBytes.byteLength - bodyIndex) / NUM_BYTES_FLOAT32 / NUM_PROPERTIES_PLY;
