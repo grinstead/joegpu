@@ -160,12 +160,12 @@ fn projectGaussians(
   // x as is for now, but z^-1 so derivative is -z^-2
 
   let Σ_prime_full = JW * Σ * transpose(JW);
-  let Σ_prime_inv = invert_2x2(
-    mat2x2<f32>(
-      Σ_prime_full[0][0], Σ_prime_full[0][1],
-      Σ_prime_full[1][0], Σ_prime_full[1][1],
-    )
-  );
+  let varX = Σ_prime_full[0][0];
+  let covarXY = Σ_prime_full[0][1];
+  let varY = Σ_prime_full[1][1];
+
+  let determinant = varX * varY - covarXY * covarXY;
+  let det_inv = 1.0 / determinant;
 
   let chunkId = vec2u(
     saturate((screenSpace.xy + 1) / 2) / chunkDims
@@ -179,7 +179,7 @@ fn projectGaussians(
       16,
       16,
     ),
-    vec3f(Σ_prime_inv[0][0], Σ_prime_inv[0][1], Σ_prime_inv[1][1]),
+    det_inv * vec3f(varY, -covarXY, varX),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
       normalize_opacity(in.opacity),
