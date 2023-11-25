@@ -1,5 +1,6 @@
 import { GPUCanvasDetails } from "./GPUCanvas.tsx";
 import { COMMON_DEFS, writeToBuffer } from "./gpu_utils.ts";
+import { parallelPrefixSum } from "./parallelPrefixSum.ts";
 import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
@@ -79,6 +80,7 @@ const HARMONIC_COEFF0: f32 = 0.28209479177387814;
 @group(0) @binding(1) var<uniform> camera: mat4x4f; 
 @group(0) @binding(2) var<storage, read_write> projectedGaussians: array<ProjectedGaussian>;
 @group(0) @binding(3) var<uniform> slice: Slice;
+@group(0) @binding(4) var<storage, read_write> tilesPerSplat: array<u32>;
 
 fn invert_2x2(input: mat2x2<f32>) -> mat2x2<f32> {
   return (1 / determinant(input)) * mat2x2<f32>(
@@ -175,6 +177,8 @@ fn projectGaussians(
       normalize_opacity(in.opacity),
     ),
   );
+
+  tilesPerSplat[slice.offset + index.x] = 1;
 }
         `,
       }),
@@ -197,10 +201,13 @@ const NUM_BUCKETS: u32 = 1 << NUM_BITS_PER_BUCKET;
 
 @group(0) @binding(0) var<storage> gaussians: array<ProjectedGaussian>;
 @group(0) @binding(1) var<uniform> slice: Slice;
+@group(0) @binding(2) var<storage> tileAllocatedSplatIndices: array<u32>;
+
+@group(0) @binding(3) var<storage, read_write> tileAllocatedSplats: array<ProjectedGaussian>;
 
 // these should always be empty
-@group(0) @binding(2) var<storage, read_write> globalHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES>;
-@group(0) @binding(3) var<storage, read_write> nextTileStart: atomic<u32>;
+@group(0) @binding(4) var<storage, read_write> globalHistogram: array<array<atomic<u32>, NUM_BUCKETS>, NUM_PASSES>;
+@group(0) @binding(5) var<storage, read_write> nextTileStart: atomic<u32>;
 
 override blockSize: u32 = 256;
 override itemsPerThreadPerTile: u32 = 16;
@@ -231,7 +238,12 @@ fn computeBinSizes(
       i < end;
       i += blockSize
     ) {
-      let key = gaussians[slice.offset + i].sortKey;
+      let splat = gaussians[slice.offset + i];
+      let baseIndex = tileAllocatedSplatIndices[slice.offset + i];
+
+      tileAllocatedSplats[baseIndex] = splat;
+
+      let key = splat.sortKey;
       
       for (var round: u32 = 0; round < NUM_PASSES; round++) {
         let subkey = extractBits(
@@ -663,6 +675,8 @@ fn renderGaussians(
   let bucketRangesBuffer: undefined | GPUBuffer;
   let bucketizeDataBindGroups: undefined | Array<GPUBindGroup>;
   let renderDataBindGroups: undefined | Array<GPUBindGroup>;
+  let tilesPerSplatBuffer: undefined | GPUBuffer;
+  let prefixSum: undefined | ReturnType<typeof parallelPrefixSum>;
 
   // creates a shader that needs to draw 4 points, one for each corner of the screen
   const outputShader = device.createShaderModule({
@@ -779,6 +793,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
       });
       histogramsBuffer?.destroy();
       bucketRangesBuffer?.destroy();
+      tilesPerSplatBuffer?.destroy();
 
       writeToBuffer(
         device.queue,
@@ -791,6 +806,18 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         projectedSliceBuffer,
         new Uint32Array([0, numTiles * TILE_SIZE])
       );
+
+      tilesPerSplatBuffer = device.createBuffer({
+        label: "Number of Tiles per Gaussian",
+        usage: GPUBufferUsage.STORAGE,
+        size: numSplats * NUM_BYTES_UINT32,
+      });
+
+      prefixSum = parallelPrefixSum(device, numSplats);
+      prefixSum.prep({
+        values: tilesPerSplatBuffer,
+        slice: dataSliceBuffer,
+      });
 
       projectedGaussianBuffers = ["", " (scratch-space)"].map((name) =>
         device.createBuffer({
@@ -809,6 +836,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
             { binding: 1, resource: { buffer: cameraBuffer } },
             { binding: 2, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 3, resource: { buffer: dataSliceBuffer } },
+            { binding: 4, resource: { buffer: tilesPerSplatBuffer } },
           ],
         }),
       ];
@@ -826,8 +854,10 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           entries: [
             { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
-            { binding: 2, resource: { buffer: histogramBuffer } },
-            { binding: 3, resource: { buffer: nextTileIndexBuffer } },
+            { binding: 2, resource: { buffer: tilesPerSplatBuffer } },
+            { binding: 3, resource: { buffer: projectedGaussianBuffers[1] } },
+            { binding: 4, resource: { buffer: histogramBuffer } },
+            { binding: 5, resource: { buffer: nextTileIndexBuffer } },
           ],
         }),
       ];
@@ -838,11 +868,11 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           entries: [
             {
               binding: 0,
-              resource: { buffer: projectedGaussianBuffers![oddRound] },
+              resource: { buffer: projectedGaussianBuffers![1 - oddRound] },
             },
             {
               binding: 1,
-              resource: { buffer: projectedGaussianBuffers![1 - oddRound] },
+              resource: { buffer: projectedGaussianBuffers![oddRound] },
             },
             { binding: 2, resource: { buffer: histogramsBuffer! } },
           ],
@@ -881,7 +911,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
           label: "Bucketize Bind Group",
           layout: bucketizePipeline.getBindGroupLayout(0),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[1] } },
             { binding: 1, resource: { buffer: bucketRangesBuffer } },
             { binding: 2, resource: { buffer: dataSliceBuffer } },
           ],
@@ -893,7 +923,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBindGroup({
           layout: guassianPipeline.getBindGroupLayout(1),
           entries: [
-            { binding: 0, resource: { buffer: projectedGaussianBuffers[0] } },
+            { binding: 0, resource: { buffer: projectedGaussianBuffers[1] } },
             { binding: 1, resource: { buffer: dataSliceBuffer } },
             { binding: 2, resource: { buffer: bucketRangesBuffer } },
           ],
@@ -923,6 +953,8 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     });
     projectionPass.dispatchWorkgroups(Math.ceil(numSplats / 256));
     projectionPass.end();
+
+    prefixSum!.runPrefixSum(encoder, numSplats);
 
     // reset the histogram
     encoder.clearBuffer(histogramBuffer);
