@@ -115,6 +115,15 @@ fn projectGaussians(
 
   let camera_space_origin = camera * vec4<f32>(in.origin[0], in.origin[1], in.origin[2], 1.0);
   let z = camera_space_origin.z;
+  let screenSpace = vec3f(camera_space_origin.xy / z, z);
+
+  if (
+    z < 0.01 ||
+    screenSpace.x < -1|| 1 < screenSpace.x ||
+    screenSpace.y < -1 || 1 < screenSpace.y
+  ) {
+    return;
+  }
 
   // quaternion to matrix formula taken from
   // https://automaticaddison.com/how-to-convert-a-quaternion-to-a-rotation-matrix/
@@ -143,7 +152,7 @@ fn projectGaussians(
   let JW = mat4x4<f32>(
     1 / z, 0, 0, 0,
     0, 1 / z, 0, 0,
-    -camera_space_origin.x / z / z, -camera_space_origin.y / z / z, 0, 0,
+    -screenSpace.x / z, -screenSpace.y / z, 0, 0,
     0, 0, 0, 0,
   ) * camera; 
 
@@ -158,7 +167,6 @@ fn projectGaussians(
     )
   );
 
-  let screenSpace = vec3f(camera_space_origin.xy / z, z);
   let chunkId = vec2u(
     saturate((screenSpace.xy + 1) / 2) / chunkDims
   );
@@ -240,10 +248,14 @@ fn computeBinSizes(
     ) {
       let splat = gaussians[slice.offset + i];
       let baseIndex = tileAllocatedSplatIndices[slice.offset + i];
+      let key = splat.sortKey;
+
+      if (key == 0) {
+        continue;
+      }
 
       tileAllocatedSplats[baseIndex] = splat;
 
-      let key = splat.sortKey;
       
       for (var round: u32 = 0; round < NUM_PASSES; round++) {
         let subkey = extractBits(
@@ -614,8 +626,8 @@ fn renderGaussians(
   let coords = 2 * vec2f(pixel.xy) / vec2f(textureDimensions(outputTexture)) - 1;
   var color = vec4f(0, 0, 0, 0);
 
-  // for now, to avoid all the overflow stuff, just skip the edges
-  if (chunkPosition.x == 0 || chunkPosition.x + 1 == chunkDims.x || chunkPosition.y == 0 || chunkPosition.y + 1 == chunkDims.y) {
+  // for now, to avoid all the overflow stuff, just skip the bottom corner
+  if (chunkPosition.x == 0 && chunkPosition.y == 0) {
     return;
   }
 
@@ -627,10 +639,6 @@ fn renderGaussians(
   for (var i = start; i < end; i++) {
     let in = renderables[slice.offset + i];
     let origin = in.origin;
-
-    if (origin.z < 0.01) {
-      continue;
-    }
 
     var centered = coords - origin.xy;
 
@@ -809,7 +817,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
       tilesPerSplatBuffer = device.createBuffer({
         label: "Number of Tiles per Gaussian",
-        usage: GPUBufferUsage.STORAGE,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         size: numSplats * NUM_BYTES_UINT32,
       });
 
@@ -823,7 +831,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBuffer({
           label: `Projected Gaussians Buffer${name} (size ${numSplats})`,
           size: numTiles * NUM_BYTES_TILE,
-          usage: GPUBufferUsage.STORAGE,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         })
       );
 
@@ -945,6 +953,10 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
     }
 
     writeToBuffer(device.queue, cameraBuffer, cameraMatrix);
+
+    encoder.clearBuffer(tilesPerSplatBuffer!);
+    encoder.clearBuffer(projectedGaussianBuffers![0]);
+    encoder.clearBuffer(projectedGaussianBuffers![1]);
 
     const projectionPass = encoder.beginComputePass();
     projectionPass.setPipeline(projectGaussiansPipeline);
