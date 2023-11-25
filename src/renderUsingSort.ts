@@ -119,7 +119,7 @@ fn projectGaussians(
 
   if (
     z < 0.01 ||
-    screenSpace.x < -1|| 1 < screenSpace.x ||
+    screenSpace.x < -1 || 1 < screenSpace.x ||
     screenSpace.y < -1 || 1 < screenSpace.y
   ) {
     return;
@@ -167,18 +167,38 @@ fn projectGaussians(
   let determinant = varX * varY - covarXY * covarXY;
   let det_inv = 1.0 / determinant;
 
-  let chunkId = vec2u(
-    saturate((screenSpace.xy + 1) / 2) / chunkDims
+  let meanVar = 0.5 * (varX + varY);
+  // eigenvalues
+  let lambda1 = meanVar + sqrt(max(0.1, meanVar * meanVar - determinant));
+  let lambda2 = meanVar - sqrt(max(0.1, meanVar * meanVar - determinant));
+	// let radii = 3. * sqrt(max(lambda1, lambda2));
+  // let radii = chunkDims
+  let radii = vec2f(0, 0);
+
+  // let lowerLeft = vec2u(
+  //   saturate(((screenSpace.xy - radii) + 1) / 2) / chunkDims
+  // );
+  // let upperRight = 1 + vec2u(
+  //   saturate(((screenSpace.xy + radii) + 1) / 2) / chunkDims
+  // );
+
+  let lowerLeft = vec2u(
+    saturate((screenSpace.xy - radii + 1) / 2) / chunkDims
   );
+  let upperRight = 1 + lowerLeft;
+
+  // insertBits(
+  //   1 + min(u32(max(0, screenSpace.z) * (1 << 13)), (1 << 16) - 2),
+  //   min(chunkId.y, 31) * chunksPerRow + min(chunkId.x, 31),
+  //   16,
+  //   16,
+  // ),
 
   projectedGaussians[slice.offset + index.x] = ProjectedGaussian(
     screenSpace,
-    insertBits(
-      1 + min(u32(max(0, screenSpace.z) * (1 << 13)), (1 << 16) - 2),
-      min(chunkId.y, 31) * chunksPerRow + min(chunkId.x, 31),
-      16,
-      16,
-    ),
+    // insertBits(radii.x + 1, radii.y, 16, 16),
+      (((upperRight.y << 8) + upperRight.x) << 16) +
+      (lowerLeft.y << 8) + lowerLeft.x,
     det_inv * vec3f(varY, -covarXY, varX),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -186,7 +206,7 @@ fn projectGaussians(
     ),
   );
 
-  tilesPerSplat[slice.offset + index.x] = 1;
+  tilesPerSplat[slice.offset + index.x] = (upperRight.x - lowerLeft.x) * (upperRight.y - lowerLeft.y);
 }
         `,
       }),
@@ -246,24 +266,43 @@ fn computeBinSizes(
       i < end;
       i += blockSize
     ) {
-      let splat = gaussians[slice.offset + i];
-      let baseIndex = tileAllocatedSplatIndices[slice.offset + i];
-      let key = splat.sortKey;
+      var splat = gaussians[slice.offset + i];
+      let packed = splat.sortKey;
 
-      if (key == 0) {
+      if (packed == 0) {
         continue;
       }
 
-      tileAllocatedSplats[baseIndex] = splat;
+      let upperRight = vec2u((packed >> 16) & 0xFF, (packed >> 24) & 0xFF);
+      let lowerLeft = vec2u(packed & 0xFF, (packed >> 8) & 0xFF);
+      let zBits = 1 + min(u32(max(0, splat.origin.z) * (1 << 13)), (1 << 16) - 2);
 
-      
-      for (var round: u32 = 0; round < NUM_PASSES; round++) {
-        let subkey = extractBits(
-          select(0xFFFFFFFF, key, key != 0),
-          round * NUM_BITS_PER_BUCKET,
-          NUM_BITS_PER_BUCKET
-        );
-        atomicAdd(&localHistogram[round][subkey], 1);
+      var index = tileAllocatedSplatIndices[slice.offset + i];
+      var count = 0;
+      for (var y = lowerLeft.y; y < upperRight.y; y++) {
+        for (var x = lowerLeft.x; x < upperRight.x && index < slice.length && count < 1000; x++) {
+          const chunksPerRow = 32;
+          let key = insertBits(
+            zBits,
+            y * chunksPerRow + x,
+            16,
+            16,
+          );
+          splat.sortKey = key;
+          
+          tileAllocatedSplats[index] = splat;
+          index++;
+          count++;
+
+          for (var round: u32 = 0; round < NUM_PASSES; round++) {
+            let subkey = extractBits(
+              select(0xFFFFFFFF, key, key != 0),
+              round * NUM_BITS_PER_BUCKET,
+              NUM_BITS_PER_BUCKET
+            );
+            atomicAdd(&localHistogram[round][subkey], 1);
+          }
+        }
       }
     }
 
