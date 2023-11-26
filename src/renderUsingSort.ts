@@ -100,7 +100,11 @@ fn normalize_opacity(in: f32) -> f32 {
 
 // todo: make this overridable maybe?
 const chunkDims = vec2f(16. / 512, 16. / 512);
-const chunksPerRow = u32(1. / chunkDims.y);
+const chunksPerRow = i32(1. / chunkDims.y);
+
+fn chunkOf(screenSpace: vec2f) -> vec2i {
+  return vec2i((screenSpace * .5 + .5) / chunkDims);
+}
 
 override blockSize: u32 = 256;
 @compute @workgroup_size(blockSize)
@@ -167,38 +171,39 @@ fn projectGaussians(
   let determinant = varX * varY - covarXY * covarXY;
   let det_inv = 1.0 / determinant;
 
+  // the fact that the mean of the eigenvalues is the mean of the trace of a matrix
+  // is referenced in https://www.youtube.com/watch?v=e50Bj7jn9IQ
   let meanVar = 0.5 * (varX + varY);
-  // eigenvalues
-  let lambda1 = meanVar + sqrt(max(0.1, meanVar * meanVar - determinant));
-  let lambda2 = meanVar - sqrt(max(0.1, meanVar * meanVar - determinant));
-	// let radii = 3. * sqrt(max(lambda1, lambda2));
-  // let radii = chunkDims
-  let radii = vec2f(0, 0);
 
-  // let lowerLeft = vec2u(
-  //   saturate(((screenSpace.xy - radii) + 1) / 2) / chunkDims
-  // );
-  // let upperRight = 1 + vec2u(
-  //   saturate(((screenSpace.xy + radii) + 1) / 2) / chunkDims
-  // );
+  // we know the mean is positive because variance is always positive, so the max
+  // is going to be gotten by adding the sqrt
+  let maxEigenvalue = meanVar + sqrt(meanVar * meanVar - determinant);
 
-  let lowerLeft = vec2u(
-    saturate((screenSpace.xy - radii + 1) / 2) / chunkDims
-  );
-  let upperRight = 1 + lowerLeft;
+  // 3 times larger than the max standard deviation
+  let radius: f32 = 3.0 * sqrt(maxEigenvalue);
 
-  // insertBits(
-  //   1 + min(u32(max(0, screenSpace.z) * (1 << 13)), (1 << 16) - 2),
-  //   min(chunkId.y, 31) * chunksPerRow + min(chunkId.x, 31),
-  //   16,
-  //   16,
-  // ),
+
+  var lowerLeft = chunkOf(screenSpace.xy - radius);
+  var upperRight = chunkOf(screenSpace.xy + radius) + 1;
+
+  if (
+    upperRight.x <= 0 || upperRight.y <= 0 ||
+    lowerLeft.x >= chunksPerRow || lowerLeft.y >= chunksPerRow
+  ) {
+    return;
+  }
+
+  lowerLeft = max(lowerLeft, vec2i(0, 0));
+  upperRight = min(upperRight, vec2i(chunksPerRow, chunksPerRow));
 
   projectedGaussians[slice.offset + index.x] = ProjectedGaussian(
     screenSpace,
-    // insertBits(radii.x + 1, radii.y, 16, 16),
+    // for the first projection, we encode our bounding box, that will
+    // be expanded out later
+    u32(
       (((upperRight.y << 8) + upperRight.x) << 16) +
-      (lowerLeft.y << 8) + lowerLeft.x,
+      (lowerLeft.y << 8) + lowerLeft.x
+    ),
     det_inv * vec3f(varY, -covarXY, varX),
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
@@ -206,7 +211,7 @@ fn projectGaussians(
     ),
   );
 
-  tilesPerSplat[slice.offset + index.x] = (upperRight.x - lowerLeft.x) * (upperRight.y - lowerLeft.y);
+  tilesPerSplat[slice.offset + index.x] = u32((upperRight.x - lowerLeft.x) * (upperRight.y - lowerLeft.y));
 }
         `,
       }),
