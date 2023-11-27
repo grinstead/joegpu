@@ -121,11 +121,7 @@ fn projectGaussians(
   let z = camera_space_origin.z;
   let screenSpace = vec3f(camera_space_origin.xy / z, z);
 
-  if (
-    z < 0.01 ||
-    screenSpace.x < -1 || 1 < screenSpace.x ||
-    screenSpace.y < -1 || 1 < screenSpace.y
-  ) {
+  if (z < 0.3) {
     return;
   }
 
