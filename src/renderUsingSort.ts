@@ -193,8 +193,8 @@ fn projectGaussians(
     // for the first projection, we encode our bounding box, that will
     // be expanded out later
     u32(
-      (((upperRight.y << 8) + upperRight.x) << 16) +
-      (lowerLeft.y << 8) + lowerLeft.x
+      (upperRight.y << 24) + (upperRight.x << 16) +
+       (lowerLeft.y <<  8) + (lowerLeft.x)
     ),
     // inverse of 2x2 symmetric matrix
     vec3f(varY, -covarXY, varX) / determinant,
@@ -606,8 +606,12 @@ ${COMMON_DEFS}
 override blockSize: u32 = 256;
 override bitsForIndex: u32 = 16;
 
+fn normalizeKey(key: u32) -> u32 {
+  return select(0xFFFFFFFF, key, key != 0);
+}
+
 fn bucketOf(index: u32) -> u32 {
-  return gaussians[slice.offset + index].sortKey >> (32 - bitsForIndex);
+  return normalizeKey(gaussians[slice.offset + index].sortKey) >> (32 - bitsForIndex);
 }
 
 @compute @workgroup_size(blockSize)
@@ -662,11 +666,6 @@ fn renderGaussians(
 ) {
   let coords = 2 * vec2f(pixel.xy) / vec2f(textureDimensions(outputTexture)) - 1;
   var color = vec4f(0, 0, 0, 0);
-
-  // for now, to avoid all the overflow stuff, just skip the bottom corner
-  if (chunkPosition.x == 0 && chunkPosition.y == 0) {
-    return;
-  }
 
   let chunkId = chunkPosition.y * chunkDims.x + chunkPosition.x;
 
