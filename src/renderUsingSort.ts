@@ -276,9 +276,8 @@ fn computeBinSizes(
       let zBits = 1 + min(u32(max(0, splat.origin.z) * (1 << 13)), (1 << 16) - 2);
 
       var index = tileAllocatedSplatIndices[slice.offset + i];
-      var count = 0;
       for (var y = lowerLeft.y; y < upperRight.y; y++) {
-        for (var x = lowerLeft.x; x < upperRight.x && index < slice.length && count < 1000; x++) {
+        for (var x = lowerLeft.x; x < upperRight.x && index < slice.length; x++) {
           const chunksPerRow = 32;
           let key = insertBits(
             zBits,
@@ -290,7 +289,6 @@ fn computeBinSizes(
           
           tileAllocatedSplats[index] = splat;
           index++;
-          count++;
 
           for (var round: u32 = 0; round < NUM_PASSES; round++) {
             let subkey = extractBits(
