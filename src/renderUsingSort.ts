@@ -179,18 +179,16 @@ fn projectGaussians(
   let radius: f32 = 3.0 * sqrt(maxEigenvalue);
 
 
-  var lowerLeft = chunkOf(screenSpace.xy - radius);
-  var upperRight = chunkOf(screenSpace.xy + radius) + 1;
+  let lowerLeft = max(chunkOf(screenSpace.xy - radius), vec2i(0, 0));
+  var upperRight = min(chunkOf(screenSpace.xy + radius) + 1, vec2i(chunksPerRow, chunksPerRow));
 
-  if (
-    upperRight.x <= 0 || upperRight.y <= 0 ||
-    lowerLeft.x >= chunksPerRow || lowerLeft.y >= chunksPerRow
-  ) {
+  // this implicitly is checking if the rectangle is entirely off-screen.
+  // for example, if the rectangle is to the right of the screen, then the upperRight point will
+  // have been trimmed down to be <= the lowerLeft point (which is not capped from above)
+  if (lowerLeft.x >= upperRight.x || lowerLeft.y >= upperRight.y) {
     return;
   }
 
-  lowerLeft = max(lowerLeft, vec2i(0, 0));
-  upperRight = min(upperRight, vec2i(chunksPerRow, chunksPerRow));
 
   projectedGaussians[slice.offset + index.x] = ProjectedGaussian(
     screenSpace,
