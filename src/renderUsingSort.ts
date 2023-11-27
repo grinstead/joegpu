@@ -178,7 +178,7 @@ fn projectGaussians(
   let radius: f32 = 3.0 * sqrt(maxEigenvalue);
 
   let lowerLeft = max(chunkOf(screenSpace.xy - radius), vec2i(0, 0));
-  var upperRight = min(chunkOf(screenSpace.xy + radius) + 1, vec2i(chunksPerRow, chunksPerRow));
+  let upperRight = min(chunkOf(screenSpace.xy + radius) + 1, vec2i(chunksPerRow, chunksPerRow));
 
   // this implicitly is checking if the rectangle is entirely off-screen.
   // for example, if the rectangle is to the right of the screen, then the upperRight point will
@@ -187,6 +187,12 @@ fn projectGaussians(
     return;
   }
 
+  // For debugging, remove huge splats
+  // if ((upperRight.x - lowerLeft.x) * (upperRight.y - lowerLeft.y) > 32) {
+  //   return;
+  // }
+
+  tilesPerSplat[slice.offset + index.x] = u32((upperRight.x - lowerLeft.x) * (upperRight.y - lowerLeft.y));
 
   splats[slice.offset + index.x] = Splat(
     screenSpace,
@@ -203,8 +209,6 @@ fn projectGaussians(
       normalize_opacity(in.opacity),
     ),
   );
-
-  tilesPerSplat[slice.offset + index.x] = u32((upperRight.x - lowerLeft.x) * (upperRight.y - lowerLeft.y));
 }
         `,
       }),
