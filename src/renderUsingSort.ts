@@ -165,7 +165,6 @@ fn projectGaussians(
   let varY = Σ_prime_full[1][1];
 
   let determinant = varX * varY - covarXY * covarXY;
-  let det_inv = 1.0 / determinant;
 
   // the fact that the mean of the eigenvalues is the mean of the trace of a matrix
   // is referenced in https://www.youtube.com/watch?v=e50Bj7jn9IQ
@@ -177,7 +176,6 @@ fn projectGaussians(
 
   // 3 times larger than the max standard deviation
   let radius: f32 = 3.0 * sqrt(maxEigenvalue);
-
 
   let lowerLeft = max(chunkOf(screenSpace.xy - radius), vec2i(0, 0));
   var upperRight = min(chunkOf(screenSpace.xy + radius) + 1, vec2i(chunksPerRow, chunksPerRow));
@@ -198,7 +196,8 @@ fn projectGaussians(
       (((upperRight.y << 8) + upperRight.x) << 16) +
       (lowerLeft.y << 8) + lowerLeft.x
     ),
-    det_inv * vec3f(varY, -covarXY, varX),
+    // inverse of 2x2 symmetric matrix
+    vec3f(varY, -covarXY, varX) / determinant,
     vec4<f32>(
       vec3f(in.color_sh0[0], in.color_sh0[1], in.color_sh0[2]) * HARMONIC_COEFF0 + .5,
       normalize_opacity(in.opacity),
