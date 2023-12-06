@@ -5,7 +5,7 @@ import { NUM_BYTES_FLOAT32, NUM_BYTES_UINT32 } from "./utils.ts";
 
 const CHUNK_SIZE = 16;
 
-const TILE_SIZE = 512;
+const SPLATS_PER_TILE = 512;
 const NUM_BUCKETS = 256;
 
 const HISTOGRAM_SIZE = NUM_BUCKETS * NUM_BYTES_UINT32;
@@ -21,7 +21,7 @@ struct Splat {
 `;
 
 const NUM_BYTES_SPLAT = 12 * NUM_BYTES_FLOAT32;
-const NUM_BYTES_TILE = TILE_SIZE * NUM_BYTES_SPLAT;
+const NUM_BYTES_TILE = SPLATS_PER_TILE * NUM_BYTES_SPLAT;
 
 export function renderUsingSort(props: GPUCanvasDetails, splatData: GPUBuffer) {
   const { canvas, context, device, format } = props;
@@ -386,7 +386,7 @@ fn exclusivePrefixSum(
     size: 2 * NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
   });
-  const projectedSliceBuffer = device.createBuffer({
+  const splatsSliceBuffer = device.createBuffer({
     size: 2 * NUM_BYTES_UINT32,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
   });
@@ -830,7 +830,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   return render;
 
   function render(numGaussians: number, cameraMatrix: Float32Array) {
-    const numTiles = Math.ceil(numGaussians / TILE_SIZE);
+    const numTiles = Math.ceil((8 * numGaussians) / SPLATS_PER_TILE);
     const encoder = device.createCommandEncoder();
 
     if (numGaussians !== prevNumGaussians) {
@@ -849,8 +849,8 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
       writeToBuffer(
         device.queue,
-        projectedSliceBuffer,
-        new Uint32Array([0, numTiles * TILE_SIZE])
+        splatsSliceBuffer,
+        new Uint32Array([0, numTiles * SPLATS_PER_TILE])
       );
 
       tilesPerSplatBuffer = device.createBuffer({
@@ -867,7 +867,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
 
       splatBuffers = ["", " (scratch-space)"].map((name) =>
         device.createBuffer({
-          label: `Projected Gaussians Buffer${name} (size ${numGaussians})`,
+          label: `Projected Gaussians Buffer${name} (tile-count ${numTiles})`,
           size: numTiles * NUM_BYTES_TILE,
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         })
@@ -926,7 +926,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
         device.createBindGroup({
           layout: sortPipeline.getBindGroupLayout(1),
           entries: [
-            { binding: 0, resource: { buffer: projectedSliceBuffer } },
+            { binding: 0, resource: { buffer: splatsSliceBuffer } },
             {
               binding: 1,
               resource: {
