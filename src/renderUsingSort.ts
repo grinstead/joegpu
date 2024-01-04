@@ -215,6 +215,13 @@ fn projectGaussians(
     },
   });
 
+  /**
+   * This shader pipeline precomputes the metadata necessary for radix sort, as
+   * well as expands each projected splat into each of its constituent buckets.
+   *
+   * TODO: honestly, this might be a bottleneck, it could be faster to separate
+   * splat projection spreading from bin-size counting.
+   */
   const binSizingPipeline = device.createComputePipeline({
     layout: "auto",
     compute: {
@@ -391,6 +398,9 @@ fn exclusivePrefixSum(
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
   });
 
+  /**
+   * This pipeline will run radix sort on the splat data.
+   */
   const sortPipeline = device.createComputePipeline({
     layout: "auto",
     compute: {
@@ -830,7 +840,7 @@ fn fragment_main(@location(0) fragUV: vec2f) -> @location(0) vec4f {
   return render;
 
   function render(numGaussians: number, cameraMatrix: Float32Array) {
-    const numTiles = Math.ceil((8 * numGaussians) / SPLATS_PER_TILE);
+    const numTiles = 8 * Math.ceil(numGaussians / SPLATS_PER_TILE);
     const encoder = device.createCommandEncoder();
 
     if (numGaussians !== prevNumGaussians) {
